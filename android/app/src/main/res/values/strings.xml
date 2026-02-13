@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">DayGrid</string>
+    <string name="title_activity_main">DayGrid</string>
+    <string name="package_name">wusan.daygrid</string>
+    <string name="custom_url_scheme">wusan.daygrid</string>
+</resources>
