@@ -66,3 +66,15 @@ button:focus-visible {
     background-color: #f9f9f9;
   }
 }
+
+:root {
+  /* iOS/部分安卓 WebView 支持 */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* 推荐：用一个 app 根容器包住所有页面 */
+.app-shell {
+  padding-top: calc(var(--safe-top) + 8px);
+  padding-bottom: var(--safe-bottom);
+}

@@ -2,13 +2,14 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import localforage from "localforage";
 
 /**
- * DayGrid v1.2 (iOS-like, mobile-first)
+ * DayGrid v1.2+ (iOS-like, mobile-first)
  * - 96 slots/day (15m each), displayed as 12 rows x 8 cols (2 hours per row)
  * - Minimal grid: events rendered as "segment blocks" in an overlay layer, so labels can span multiple cells
  * - Hour rail row above each 2-hour row so time ticks never get covered
  * - Selection + bottom action sheet (iOS-like)
  * - Fix: bottom buttons not responding caused by "tap blank to clear selection" — now excluded via data-noclear
- * - Local persistence + quick recent + fixed copy + stats + import/export
+ * - Fix: modal click cleared selection => apply event not working (stopPropagation + data-noclear)
+ * - Fix: scroll vs drag selection conflict (pan-y + scroll-intent detection + cross-row cancel)
  */
 
 type Tab = "record" | "stats" | "more";
@@ -29,6 +30,11 @@ const SLOT_MINUTES = 15;
 const TOTAL_SLOTS = 96;
 const START_HOUR = 8; // timeline starts at 08:00
 const RECENT_LIMIT = 8;
+
+// ✅ 滚动意图阈值
+const SCROLL_DY = 10; // px
+const SCROLL_DY_STRONG = 18; // px (更强滚动意图)
+const ROW_SLOTS = 8;
 
 const store = localforage.createInstance({ name: "daygrid" });
 
@@ -221,8 +227,18 @@ function EventPickerModal(props: {
   const chipBg = isDark ? "rgba(255,255,255,0.06)" : "rgba(255,255,255,0.92)";
 
   return (
-    <div style={{ ...modalStyles.backdrop, background: bg }} onClick={onClose}>
-      <div style={{ ...modalStyles.modal, background: panel, border: `1px solid ${border}` }} onClick={(e) => e.stopPropagation()}>
+    <div
+      data-noclear="true"
+      style={{ ...modalStyles.backdrop, background: bg }}
+      onClick={onClose}
+      onPointerDown={(e) => e.stopPropagation()} // ✅ 不让 record 页清空选区
+    >
+      <div
+        data-noclear="true"
+        style={{ ...modalStyles.modal, background: panel, border: `1px solid ${border}` }}
+        onClick={(e) => e.stopPropagation()}
+        onPointerDown={(e) => e.stopPropagation()} // ✅ 更稳
+      >
         <div style={modalStyles.header}>
           <div style={{ fontWeight: 900, color: text, fontSize: 16 }}>选择事件</div>
           <button style={{ ...modalStyles.closeBtn, border: `1px solid ${border}`, color: text, background: chipBg }} onClick={onClose}>
@@ -372,6 +388,14 @@ export default function App() {
   const [isSelecting, setIsSelecting] = useState(false);
   const anchorRef = useRef<number | null>(null);
 
+  // ✅ scroll vs select
+  const isScrollingRef = useRef(false);
+  const startPtRef = useRef<{ x: number; y: number } | null>(null);
+
+  function shouldTreatAsScroll(dx: number, dy: number) {
+    return Math.abs(dy) > SCROLL_DY && Math.abs(dy) > Math.abs(dx) * 1.2;
+  }
+
   // drag/click handling
   const draggedRef = useRef(false);
   const pressSlotRef = useRef<{ start: number } | null>(null);
@@ -411,8 +435,11 @@ export default function App() {
       setIsSelecting(false);
       anchorRef.current = null;
       setShowPicker(false);
+
       draggedRef.current = false;
       pressSlotRef.current = null;
+      isScrollingRef.current = false;
+      startPtRef.current = null;
     })();
   }, [dateKey]);
 
@@ -453,7 +480,10 @@ export default function App() {
   }
 
   function onCellPointerDown(e: React.PointerEvent, startSlot: number) {
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    // ✅ 记录起点（用于判定滚动意图）
+    startPtRef.current = { x: e.clientX, y: e.clientY };
+    isScrollingRef.current = false;
+
     pressSlotRef.current = { start: startSlot };
     draggedRef.current = false;
     setIsSelecting(false);
@@ -463,13 +493,47 @@ export default function App() {
   function onGridPointerMove(e: React.PointerEvent) {
     if (e.buttons === 0) return;
 
-    if (!isSelecting) {
-      const p = pressSlotRef.current;
-      if (!p) return;
+    const p0 = startPtRef.current;
+    const press = pressSlotRef.current;
 
+    // 没有按下起点，就不处理
+    if (!p0 || !press) return;
+
+    const dx = e.clientX - p0.x;
+    const dy = e.clientY - p0.y;
+
+    // ✅ 若明显是纵向滚动意图：放行滚动（不要进入选择）
+    if (shouldTreatAsScroll(dx, dy) || Math.abs(dy) > SCROLL_DY_STRONG) {
+      isScrollingRef.current = true;
+
+      // 如果已经在选了，且跨行了，就退出选择
+      if (isSelecting) {
+        const a = anchorRef.current;
+        const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
+        const cellEl = el?.closest("[data-slot]") as HTMLElement | null;
+        const cur = cellEl ? Number(cellEl.dataset.slot) : NaN;
+
+        if (a != null && !Number.isNaN(cur)) {
+          const aRow = Math.floor(a / ROW_SLOTS);
+          const cRow = Math.floor(cur / ROW_SLOTS);
+          if (aRow !== cRow) {
+            setIsSelecting(false);
+            anchorRef.current = null;
+            pressSlotRef.current = null;
+            return;
+          }
+        }
+      }
+
+      // 没进入选择时，直接 return 让系统滚动接管
+      return;
+    }
+
+    // ✅ 到这里才允许进入选择逻辑
+    if (!isSelecting) {
       setIsSelecting(true);
-      anchorRef.current = p.start;
-      setSelected(new Set([p.start]));
+      anchorRef.current = press.start;
+      setSelected(new Set([press.start]));
     }
 
     const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
@@ -492,13 +556,20 @@ export default function App() {
     setIsSelecting(false);
     anchorRef.current = null;
     pressSlotRef.current = null;
+    startPtRef.current = null;
+
+    // ✅ 释放滚动状态（避免滚动后误触 click）
     setTimeout(() => {
       draggedRef.current = false;
+      isScrollingRef.current = false;
     }, 0);
   }
 
   function onCellTapToggle(startSlot: number) {
+    // ✅ 滚动手势后不触发 toggle
+    if (isScrollingRef.current) return;
     if (draggedRef.current) return;
+
     setSelected((prev) => {
       const next = new Set(prev);
       if (next.has(startSlot)) next.delete(startSlot);
@@ -727,7 +798,7 @@ export default function App() {
   }
 
   return (
-    <div style={styles.app} onPointerUp={onPointerUp} onPointerMove={onGridPointerMove}>
+    <div className="app-shell" style={styles.app} onPointerUp={onPointerUp} onPointerMove={onGridPointerMove}>
       <Header
         current={tab}
         onChange={setTab}
@@ -744,8 +815,8 @@ export default function App() {
           style={styles.page}
           onPointerDown={(e) => {
             const target = e.target as HTMLElement;
-            if (isClickInsideNoClear(target)) return;          // ✅ FIX: bottom sheet / modal triggers won't clear
-            if (target.closest("[data-slot]")) return;         // clicking a cell doesn't clear
+            if (isClickInsideNoClear(target)) return; // ✅ bottom sheet / modal won't clear
+            if (target.closest("[data-slot]")) return; // clicking a cell doesn't clear
             clearSelection();
           }}
         >
@@ -762,7 +833,7 @@ export default function App() {
 
           <div style={styles.quickRow}>
             <div style={styles.subtle}>快速（最近）</div>
-            <div style={styles.chipsScroll}>
+            <div style={styles.chipsScroll} data-noclear="true">
               {recentEvents.map((eid) => {
                 const ev = eventById.get(eid);
                 if (!ev) return null;
@@ -1177,9 +1248,45 @@ function Header(props: {
   const { current, onChange, dateKey, onPrevDay, onNextDay, onToday, theme, isDark } = props;
 
   return (
-    <div style={{ ...headerStyles.header, background: theme.headerBg, borderBottom: `1px solid ${theme.hairline}` }}>
+    <div style={{ ...headerStyles.header, background: theme.headerBg, borderBottom: `1px solid ${theme.hairline}` }} data-noclear="true">
       <div style={headerStyles.left}>
-        <div style={{ ...headerStyles.brand, color: theme.text }}>DayGrid</div>
+        {/* ✅ 更像 App 的标题（图标 + 渐变字） */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div
+            style={{
+              width: 26,
+              height: 26,
+              borderRadius: 8,
+              background: isDark ? "rgba(255,255,255,0.10)" : "rgba(17,24,39,0.08)",
+              border: `1px solid ${theme.hairline}`,
+              display: "grid",
+              placeItems: "center",
+              boxShadow: theme.shadow,
+              fontWeight: 1000,
+              color: theme.text,
+            }}
+            aria-hidden="true"
+          >
+            ▦
+          </div>
+
+          <div
+            style={{
+              fontWeight: 1000,
+              fontSize: 18,
+              letterSpacing: -0.4,
+              background: isDark
+                ? "linear-gradient(180deg, #ffffff, rgba(255,255,255,0.60))"
+                : "linear-gradient(180deg, #0b0f17, rgba(11,15,23,0.55))",
+              WebkitBackgroundClip: "text",
+              color: "transparent",
+              lineHeight: 1,
+            }}
+          >
+            DayGrid
+            <span style={{ marginLeft: 6, fontSize: 12, color: theme.sub, fontWeight: 900 }}>15m</span>
+          </div>
+        </div>
 
         <div style={headerStyles.dateRow}>
           <button style={{ ...headerStyles.icon, color: theme.text, border: `1px solid ${theme.hairline}`, background: theme.panel }} onClick={onPrevDay}>
@@ -1300,27 +1407,26 @@ function makeStyles(theme: ReturnType<typeof makeThemeTokens>, isDark: boolean) 
   const font = `system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial`;
   return {
     app: {
-  fontFamily: font,
-  background: theme.bg,
-  color: theme.text,
+      fontFamily: font,
+      background: theme.bg,
+      color: theme.text,
 
-  // ✅ 关键：确保每个 tab 都是全屏布局，不会被“居中裁切”
-  minHeight: "100dvh",
-  height: "100dvh",
-  width: "100vw",
-  maxWidth: "100vw",
+      minHeight: "100dvh",
+      height: "100dvh",
+      width: "100vw",
+      maxWidth: "100vw",
 
-  // ✅ 允许纵向滚动；禁用横向溢出，避免右侧被裁
-  overflowY: "auto",
-  overflowX: "hidden",
+      overflowY: "auto",
+      overflowX: "hidden",
 
-  // ✅ 去掉外层 padding，避免 iPhone 模拟时右侧/顶部“挤掉”
-  padding: 0,
-  margin: 0,
+      padding: 0,
+      margin: 0,
 
-  // ✅ iOS/Android 滚动更像原生
-  WebkitOverflowScrolling: "touch",
-},
+      // ✅ Safe area 兜底（让顶部不被状态栏压住）
+      paddingTop: "env(safe-area-inset-top, 0px)",
+
+      WebkitOverflowScrolling: "touch",
+    },
 
     page: { padding: "0 12px 16px 12px" },
 
@@ -1428,7 +1534,9 @@ function makeStyles(theme: ReturnType<typeof makeThemeTokens>, isDark: boolean) 
       minHeight: 44,
       cursor: "pointer",
       userSelect: "none",
-      touchAction: "none",
+
+      // ✅ 关键：允许纵向滚动
+      touchAction: "pan-y",
     },
 
     rowOverlay: {
@@ -1440,9 +1548,9 @@ function makeStyles(theme: ReturnType<typeof makeThemeTokens>, isDark: boolean) 
 
     segBlock: {
       position: "absolute" as const,
-     top: 6,
+      top: 6,
       bottom: 6,
-     borderRadius: 14,
+      borderRadius: 14,
       overflow: "hidden",
       display: "flex",
       alignItems: "center",
@@ -1450,8 +1558,7 @@ function makeStyles(theme: ReturnType<typeof makeThemeTokens>, isDark: boolean) 
       gap: 8,
       boxShadow: isDark ? "0 10px 22px rgba(0,0,0,0.38)" : "0 10px 16px rgba(0,0,0,0.056)",
       border: `1px solid ${isDark ? "rgba(255,255,255,0.10)" : "rgba(17,24,39,0.10)"}`,
-},
-
+    },
 
     segBlockInnerGlow: {
       position: "absolute" as const,
@@ -1643,7 +1750,14 @@ const headerStyles: Record<string, React.CSSProperties> = {
     position: "sticky",
     top: 0,
     zIndex: 50,
-    padding: "12px 12px",
+
+    // ✅ Safe Area：顶部留白，避免被状态栏遮挡
+    paddingTop: "calc(env(safe-area-inset-top, 0px) + 10px)",
+
+    paddingRight: 12,
+    paddingLeft: 12,
+    paddingBottom: 12,
+
     margin: "0 0 12px 0",
     width: "100%",
     boxSizing: "border-box",
@@ -1655,7 +1769,6 @@ const headerStyles: Record<string, React.CSSProperties> = {
     flexWrap: "wrap",
   },
   left: { display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" },
-  brand: { fontWeight: 1000, fontSize: 18, letterSpacing: -0.4 },
   dateRow: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" },
   icon: { width: 34, height: 34, borderRadius: 12, cursor: "pointer", fontWeight: 950 },
   today: { height: 34, borderRadius: 12, cursor: "pointer", fontWeight: 950, padding: "0 10px" },
