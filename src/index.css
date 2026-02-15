@@ -75,6 +75,6 @@ button:focus-visible {
 
 /* 推荐：用一个 app 根容器包住所有页面 */
 .app-shell {
-  padding-top: calc(var(--safe-top) + 8px);
+  padding-top: calc(var(--safe-top) + 0px);
   padding-bottom: var(--safe-bottom);
 }

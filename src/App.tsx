@@ -1,15 +1,23 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import localforage from "localforage";
+import { Haptics, ImpactStyle } from "@capacitor/haptics";
 
 /**
- * DayGrid v1.2+ (iOS-like, mobile-first)
+ * DayGrid (mobile-first)
  * - 96 slots/day (15m each), displayed as 12 rows x 8 cols (2 hours per row)
- * - Minimal grid: events rendered as "segment blocks" in an overlay layer, so labels can span multiple cells
- * - Hour rail row above each 2-hour row so time ticks never get covered
- * - Selection + bottom action sheet (iOS-like)
- * - Fix: bottom buttons not responding caused by "tap blank to clear selection" — now excluded via data-noclear
- * - Fix: modal click cleared selection => apply event not working (stopPropagation + data-noclear)
- * - Fix: scroll vs drag selection conflict (pan-y + scroll-intent detection + cross-row cancel)
+ * - Events rendered as segments overlay
+ * - Interaction:
+ *   - Tap selects SINGLE slot (always replaces previous selection, closes modal)
+ *   - Long-press enters range-select; drag updates range (also replaces selection)
+ *   - Scroll intent gate to reduce accidental selection
+ * - Local persistence + recent + fixed copy + stats day/week + import/export
+ * - Fixes & Improvements:
+ *   1) Header safe-area tuned (avoid excessive blank)
+ *   2) Week stats Monday–Sunday + visualization (WeekStackBar)
+ *   3) Theme switch header artifact mitigation (key remount)
+ *   4) Reduce scroll mis-tap (strict tap: pointerup on same slot)
+ *   5) Modal click outside to close
+ *   6) Selection is always "reselect" (no non-contiguous / additive selection)
  */
 
 type Tab = "record" | "stats" | "more";
@@ -31,10 +39,15 @@ const TOTAL_SLOTS = 96;
 const START_HOUR = 8; // timeline starts at 08:00
 const RECENT_LIMIT = 8;
 
-// ✅ 滚动意图阈值
-const SCROLL_DY = 10; // px
-const SCROLL_DY_STRONG = 18; // px (更强滚动意图)
-const ROW_SLOTS = 8;
+// Tap vs scroll tuning (make tap stricter to reduce accidental selection)
+const TAP_MAX_MS = 230;
+const TAP_MAX_MOVE = 6; // px
+
+// Long press to enable drag-range select
+const LONG_PRESS_MS = 260;
+
+// Scroll intent
+const SCROLL_DY = 10;
 
 const store = localforage.createInstance({ name: "daygrid" });
 
@@ -63,6 +76,16 @@ function slotToTime(slotIndex: number) {
 function hmToMinutes(hm: string) {
   const [h, m] = hm.split(":").map(Number);
   return h * 60 + m;
+}
+
+function getWeekStartKey(dateKey: string) {
+  // Week starts Monday
+  const [y, m, d] = dateKey.split("-").map(Number);
+  const dt = new Date(y, m - 1, d);
+  const day = dt.getDay(); // 0 Sun .. 6 Sat
+  const deltaToMon = (day + 6) % 7;
+  dt.setDate(dt.getDate() - deltaToMon);
+  return toDateKey(dt);
 }
 
 function colorForSeed(seed: string) {
@@ -116,11 +139,12 @@ async function loadMeta() {
     { id: "evt_life_commute", categoryId: "cat_life", name: "通勤", fixed: true },
     { id: "evt_life_eat", categoryId: "cat_life", name: "吃饭", fixed: true },
     { id: "evt_study_english", categoryId: "cat_study", name: "英语课", fixed: true },
-    { id: "evt_work_only", categoryId: "cat_work", name: undefined, fixed: false },
+    { id: "evt_work_only", categoryId: "cat_work", name: "未命名", fixed: false },
   ];
 
   const categories = (await store.getItem<Category[]>("categories")) ?? defaultCategories;
   const events = (await store.getItem<EventTag[]>("events")) ?? defaultEvents;
+  
   const recent =
     (await store.getItem<string[]>("recentEvents")) ??
     ["evt_life_sleep", "evt_life_eat", "evt_life_commute", "evt_study_english", "evt_work_only"];
@@ -149,7 +173,7 @@ async function saveDay(day: DayLog) {
   await store.setItem(`day:${day.dateKey}`, day);
 }
 
-/** ===== Small SVG charts (simple + stable) ===== */
+/** ===== Small SVG charts ===== */
 function DonutChart(props: { items: { label: string; value: number; color: string }[]; size?: number; isDark: boolean }) {
   const size = props.size ?? 220;
   const stroke = 18;
@@ -205,6 +229,43 @@ function DonutChart(props: { items: { label: string; value: number; color: strin
   );
 }
 
+/** ===== Week visualization ===== */
+function WeekStackBar(props: {
+  days: { dateKey: string; total: number; parts: { label: string; minutes: number; color: string }[] }[];
+  isDark: boolean;
+}) {
+  const track = props.isDark ? "rgba(255,255,255,0.10)" : "rgba(17,24,39,0.08)";
+  return (
+    <div style={{ display: "grid", gap: 10 }}>
+      {props.days.map((d) => (
+        <div key={d.dateKey} style={{ display: "grid", gridTemplateColumns: "86px 1fr 54px", gap: 10, alignItems: "center" }}>
+          <div style={{ fontWeight: 950, opacity: 0.75 }}>{d.dateKey.slice(5)}</div>
+
+          <div
+            style={{
+              height: 12,
+              borderRadius: 999,
+              overflow: "hidden",
+              background: track,
+              display: "flex",
+            }}
+          >
+            {d.parts.map((p, idx) => {
+              const w = d.total > 0 ? (p.minutes / d.total) * 100 : 0;
+              if (w <= 0.6) return null;
+              return <div key={idx} style={{ width: `${w}%`, background: p.color }} />;
+            })}
+          </div>
+
+          <div style={{ textAlign: "right", fontWeight: 950, opacity: 0.75 }}>
+            {Math.round((d.total / 60) * 10) / 10}h
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /** ===== Modal ===== */
 function EventPickerModal(props: {
   categories: Category[];
@@ -214,10 +275,9 @@ function EventPickerModal(props: {
   catById: Map<string, Category>;
   onClose: () => void;
   onPick: (eventId: string) => void;
-  onPickCategoryOnly: (categoryId: string) => void;
   isDark: boolean;
 }) {
-  const { categories, events, recentEvents, eventById, catById, onClose, onPick, onPickCategoryOnly, isDark } = props;
+  const { categories, events, recentEvents, eventById, catById, onClose, onPick, isDark } = props;
 
   const bg = isDark ? "rgba(0,0,0,0.62)" : "rgba(0,0,0,0.35)";
   const panel = isDark ? "#0b0f17" : "#ffffff";
@@ -228,19 +288,16 @@ function EventPickerModal(props: {
 
   return (
     <div
-      data-noclear="true"
       style={{ ...modalStyles.backdrop, background: bg }}
-      onClick={onClose}
-      onPointerDown={(e) => e.stopPropagation()} // ✅ 不让 record 页清空选区
+      data-noclear="true"
+      onPointerDown={onClose} // click outside to close
     >
       <div
-        data-noclear="true"
         style={{ ...modalStyles.modal, background: panel, border: `1px solid ${border}` }}
-        onClick={(e) => e.stopPropagation()}
-        onPointerDown={(e) => e.stopPropagation()} // ✅ 更稳
+        onPointerDown={(e) => e.stopPropagation()}
       >
         <div style={modalStyles.header}>
-          <div style={{ fontWeight: 900, color: text, fontSize: 16 }}>选择事件</div>
+          <div style={{ fontWeight: 950, color: text, fontSize: 16 }}>选择事件</div>
           <button style={{ ...modalStyles.closeBtn, border: `1px solid ${border}`, color: text, background: chipBg }} onClick={onClose}>
             ✕
           </button>
@@ -279,16 +336,7 @@ function EventPickerModal(props: {
                   background: isDark ? "rgba(255,255,255,0.03)" : "rgba(17,24,39,0.03)",
                 }}
               >
-                <div style={modalStyles.groupHeader}>
-                  <div style={{ fontWeight: 900, color: text }}>{c.name}</div>
-                  <button
-                    style={{ ...modalStyles.smallBtn, border: `1px solid ${border}`, background: chipBg, color: text }}
-                    onClick={() => onPickCategoryOnly(c.id)}
-                  >
-                    仅 {c.name}
-                  </button>
-                </div>
-
+      
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 }}>
                   {evs
                     .filter((e) => e.name && e.name.trim() !== "")
@@ -377,6 +425,7 @@ export default function App() {
   const [tab, setTab] = useState<Tab>("record");
   const [dateKey, setDateKey] = useState<string>(toDateKey());
   const [day, setDay] = useState<DayLog | null>(null);
+  const [statsCatFilter, setStatsCatFilter] = useState<string | null>(null);
 
   const [settings, setSettings] = useState<Settings | null>(null);
   const [categories, setCategories] = useState<Category[]>([]);
@@ -385,20 +434,22 @@ export default function App() {
 
   // selection
   const [selected, setSelected] = useState<Set<number>>(new Set());
-  const [isSelecting, setIsSelecting] = useState(false);
   const anchorRef = useRef<number | null>(null);
 
-  // ✅ scroll vs select
-  const isScrollingRef = useRef(false);
-  const startPtRef = useRef<{ x: number; y: number } | null>(null);
+  // tap handling (reduce accidental selection while scrolling)
+  const tapRef = useRef<{ t: number; x: number; y: number; slot: number } | null>(null);
+  const lastMoveRef = useRef<{ x: number; y: number } | null>(null);
+  const downSlotRef = useRef<number | null>(null); // strict tap: pointerup must be on same slot
 
-  function shouldTreatAsScroll(dx: number, dy: number) {
-    return Math.abs(dy) > SCROLL_DY && Math.abs(dy) > Math.abs(dx) * 1.2;
-  }
-
-  // drag/click handling
+  // long press + drag-range
+  const longPressTimerRef = useRef<number | null>(null);
+  const longPressArmedRef = useRef(false);
   const draggedRef = useRef(false);
   const pressSlotRef = useRef<{ start: number } | null>(null);
+
+  // scrolling intent gate
+  const isScrollingRef = useRef(false);
+  const startPtRef = useRef<{ x: number; y: number } | null>(null);
 
   // Picker modal
   const [showPicker, setShowPicker] = useState(false);
@@ -412,6 +463,36 @@ export default function App() {
     update();
     mq.addEventListener?.("change", update);
     return () => mq.removeEventListener?.("change", update);
+  }, []);
+
+  const themeMode = settings?.themeMode ?? "system";
+  const isDark = themeMode === "dark" ? true : themeMode === "light" ? false : systemDark;
+  const theme = useMemo(() => makeThemeTokens(isDark), [isDark]);
+  const styles = useMemo(() => makeStyles(theme, isDark), [theme, isDark]);
+
+  const eventById = useMemo(() => new Map(events.map((e) => [e.id, e])), [events]);
+  const catById = useMemo(() => new Map(categories.map((c) => [c.id, c])), [categories]);
+
+  // grid: 12 rows x 8 columns (2h per row)
+  const gridRows = useMemo(() => Array.from({ length: 12 }, (_, r) => Array.from({ length: 8 }, (_, c) => r * 8 + c)), []);
+
+  // now indicator
+  const [nowSlot, setNowSlot] = useState<number | null>(null);
+  useEffect(() => {
+    const calcNowSlot = () => {
+      const now = new Date();
+      const minutesNow = now.getHours() * 60 + now.getMinutes();
+      const startMinutes = START_HOUR * 60;
+      let delta = minutesNow - startMinutes;
+      if (delta < 0) delta += 24 * 60;
+      const idx = Math.floor(delta / SLOT_MINUTES);
+      if (idx < 0 || idx >= TOTAL_SLOTS) return null;
+      return idx;
+    };
+    const tick = () => setNowSlot(calcNowSlot());
+    tick();
+    const t = window.setInterval(tick, 60 * 1000);
+    return () => window.clearInterval(t);
   }, []);
 
   // init
@@ -432,14 +513,13 @@ export default function App() {
       const d = await loadOrInitDay(dateKey);
       setDay(d);
       setSelected(new Set());
-      setIsSelecting(false);
       anchorRef.current = null;
       setShowPicker(false);
-
       draggedRef.current = false;
       pressSlotRef.current = null;
+      setStatsCatFilter(null);
+      longPressArmedRef.current = false;
       isScrollingRef.current = false;
-      startPtRef.current = null;
     })();
   }, [dateKey]);
 
@@ -455,22 +535,31 @@ export default function App() {
     saveSettings(settings).catch(() => {});
   }, [settings]);
 
-  const themeMode = settings?.themeMode ?? "system";
-  const isDark = themeMode === "dark" ? true : themeMode === "light" ? false : systemDark;
-  const theme = useMemo(() => makeThemeTokens(isDark), [isDark]);
+  function cancelLongPressTimer() {
+    if (longPressTimerRef.current != null) {
+      window.clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  }
 
-  const styles = useMemo(() => makeStyles(theme, isDark), [theme, isDark]);
+  function shouldTreatAsScroll(dx: number, dy: number) {
+    return Math.abs(dy) > SCROLL_DY && Math.abs(dy) > Math.abs(dx) * 1.1;
+  }
 
-  const eventById = useMemo(() => new Map(events.map((e) => [e.id, e])), [events]);
-  const catById = useMemo(() => new Map(categories.map((c) => [c.id, c])), [categories]);
-
-  // grid: 12 rows x 8 columns (2h per row)
-  const gridRows = useMemo(() => Array.from({ length: 12 }, (_, r) => Array.from({ length: 8 }, (_, c) => r * 8 + c)), []);
+  async function hapticLight() {
+    try {
+      await Haptics.impact({ style: ImpactStyle.Light });
+    } catch {
+      navigator.vibrate?.(12);
+    }
+  }
 
   // ===== selection helpers =====
   function clearSelection() {
     setSelected(new Set());
+    setShowPicker(false);
   }
+
   function selectRange(a: number, b: number) {
     const min = Math.min(a, b);
     const max = Math.max(a, b);
@@ -479,103 +568,122 @@ export default function App() {
     setSelected(next);
   }
 
+  function isClickInsideNoClear(target: HTMLElement | null) {
+    if (!target) return false;
+    return !!target.closest("[data-noclear='true']");
+  }
+
   function onCellPointerDown(e: React.PointerEvent, startSlot: number) {
-    // ✅ 记录起点（用于判定滚动意图）
-    startPtRef.current = { x: e.clientX, y: e.clientY };
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+
+    // ✅ Every pointer down is a "reselect" (as per latest requirement)
+    setShowPicker(false);
+    draggedRef.current = false;
+    longPressArmedRef.current = false;
     isScrollingRef.current = false;
 
+    // reset tap/scroll refs
+    tapRef.current = { t: Date.now(), x: e.clientX, y: e.clientY, slot: startSlot };
+    lastMoveRef.current = { x: e.clientX, y: e.clientY };
+    startPtRef.current = { x: e.clientX, y: e.clientY };
+    downSlotRef.current = startSlot;
+
+    // selection base
+    anchorRef.current = startSlot;
     pressSlotRef.current = { start: startSlot };
-    draggedRef.current = false;
-    setIsSelecting(false);
-    anchorRef.current = null;
+    setSelected(new Set([startSlot]));
+
+    cancelLongPressTimer();
+    longPressTimerRef.current = window.setTimeout(async () => {
+      // if already scroll intent, don't arm
+      if (isScrollingRef.current) return;
+      longPressArmedRef.current = true;
+      await hapticLight();
+    }, LONG_PRESS_MS);
   }
 
   function onGridPointerMove(e: React.PointerEvent) {
     if (e.buttons === 0) return;
+    lastMoveRef.current = { x: e.clientX, y: e.clientY };
 
-    const p0 = startPtRef.current;
-    const press = pressSlotRef.current;
+    const s = startPtRef.current;
+    if (s) {
+      const dx = e.clientX - s.x;
+      const dy = e.clientY - s.y;
 
-    // 没有按下起点，就不处理
-    if (!p0 || !press) return;
-
-    const dx = e.clientX - p0.x;
-    const dy = e.clientY - p0.y;
-
-    // ✅ 若明显是纵向滚动意图：放行滚动（不要进入选择）
-    if (shouldTreatAsScroll(dx, dy) || Math.abs(dy) > SCROLL_DY_STRONG) {
-      isScrollingRef.current = true;
-
-      // 如果已经在选了，且跨行了，就退出选择
-      if (isSelecting) {
-        const a = anchorRef.current;
-        const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
-        const cellEl = el?.closest("[data-slot]") as HTMLElement | null;
-        const cur = cellEl ? Number(cellEl.dataset.slot) : NaN;
-
-        if (a != null && !Number.isNaN(cur)) {
-          const aRow = Math.floor(a / ROW_SLOTS);
-          const cRow = Math.floor(cur / ROW_SLOTS);
-          if (aRow !== cRow) {
-            setIsSelecting(false);
-            anchorRef.current = null;
-            pressSlotRef.current = null;
-            return;
-          }
-        }
+      if (!isScrollingRef.current && shouldTreatAsScroll(dx, dy)) {
+        isScrollingRef.current = true;
+        cancelLongPressTimer();
+        longPressArmedRef.current = false;
       }
-
-      // 没进入选择时，直接 return 让系统滚动接管
-      return;
     }
 
-    // ✅ 到这里才允许进入选择逻辑
-    if (!isSelecting) {
-      setIsSelecting(true);
-      anchorRef.current = press.start;
-      setSelected(new Set([press.start]));
-    }
+    // ✅ Drag-range only after long press armed AND not scrolling
+    if (!longPressArmedRef.current) return;
+    if (isScrollingRef.current) return;
 
-    const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
-    if (!el) return;
-
-    const cellEl = el.closest("[data-slot]") as HTMLElement | null;
-    if (!cellEl) return;
-
-    const startSlot = Number(cellEl.dataset.slot);
-    if (Number.isNaN(startSlot)) return;
-
-    const a = anchorRef.current;
+    const a = anchorRef.current ?? pressSlotRef.current?.start ?? null;
     if (a == null) return;
 
+    const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
+    const cellEl = el?.closest("[data-slot]") as HTMLElement | null;
+    if (!cellEl) return;
+
+    const slot = Number(cellEl.dataset.slot);
+    if (Number.isNaN(slot)) return;
+
     draggedRef.current = true;
-    selectRange(a, startSlot);
+    selectRange(a, slot);
   }
 
-  function onPointerUp() {
-    setIsSelecting(false);
-    anchorRef.current = null;
+  function onPointerUp(e?: React.PointerEvent) {
+    cancelLongPressTimer();
+
+    const wasDrag = draggedRef.current;
+    const wasScroll = isScrollingRef.current;
+
+    // figure out pointerup slot (strict tap)
+    let upSlot: number | null = null;
+    if (e) {
+      const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
+      const cellEl = el?.closest("[data-slot]") as HTMLElement | null;
+      if (cellEl) {
+        const s = Number(cellEl.dataset.slot);
+        if (!Number.isNaN(s)) upSlot = s;
+      }
+    }
+
+    // reset
+    draggedRef.current = false;
     pressSlotRef.current = null;
+    anchorRef.current = null;
+    longPressArmedRef.current = false;
+    isScrollingRef.current = false;
     startPtRef.current = null;
 
-    // ✅ 释放滚动状态（避免滚动后误触 click）
-    setTimeout(() => {
-      draggedRef.current = false;
-      isScrollingRef.current = false;
-    }, 0);
-  }
+    const tap = tapRef.current;
+    tapRef.current = null;
 
-  function onCellTapToggle(startSlot: number) {
-    // ✅ 滚动手势后不触发 toggle
-    if (isScrollingRef.current) return;
-    if (draggedRef.current) return;
+    // If user dragged range: keep selection and let sheet appear
+    if (wasDrag) return;
 
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(startSlot)) next.delete(startSlot);
-      else next.add(startSlot);
-      return next;
-    });
+    // If user scrolled: do nothing
+    if (!tap || wasScroll) return;
+
+    // Strict tap: must end on same slot
+    if (upSlot == null || downSlotRef.current == null || upSlot !== downSlotRef.current) return;
+
+    const dt = Date.now() - tap.t;
+    const endX = e?.clientX ?? lastMoveRef.current?.x ?? tap.x;
+    const endY = e?.clientY ?? lastMoveRef.current?.y ?? tap.y;
+    const dx = Math.abs(endX - tap.x);
+    const dy = Math.abs(endY - tap.y);
+
+    if (dt <= TAP_MAX_MS && dx <= TAP_MAX_MOVE && dy <= TAP_MAX_MOVE) {
+      // ✅ Tap selects SINGLE slot, always reselect
+      setShowPicker(false);
+      setSelected(new Set([tap.slot]));
+    }
   }
 
   async function applyEvent(eventId: string | null) {
@@ -598,17 +706,6 @@ export default function App() {
     }
 
     clearSelection();
-  }
-
-  function getOrCreateCategoryOnlyEvent(categoryId: string) {
-    const existing = events.find((e) => e.categoryId === categoryId && (!e.name || e.name.trim() === ""));
-    if (existing) return existing.id;
-
-    const id = uid("evt");
-    const newEvt: EventTag = { id, categoryId, name: undefined, fixed: false };
-    setEvents((prev) => [...prev, newEvt]);
-    setRecentEvents((prev) => [id, ...prev.filter((x) => x !== id)].slice(0, RECENT_LIMIT));
-    return id;
   }
 
   async function copyFixedFromPrevDay() {
@@ -659,7 +756,16 @@ export default function App() {
   }
 
   async function exportJSON() {
-    const payload = { version: 1, exportedAt: new Date().toISOString(), dateKey, settings, categories, events, recentEvents, day };
+    const payload = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      dateKey,
+      settings,
+      categories,
+      events,
+      recentEvents,
+      day,
+    };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -697,10 +803,12 @@ export default function App() {
     if (!trimmed) return;
     setCategories((prev) => [...prev, { id: uid("cat"), name: trimmed }]);
   }
-  function addEvent(categoryId: string, name?: string) {
-    const trimmed = (name ?? "").trim();
-    setEvents((prev) => [...prev, { id: uid("evt"), categoryId, name: trimmed || undefined, fixed: false }]);
+  function addEvent(categoryId: string, name: string) {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setEvents((prev) => [...prev, { id: uid("evt"), categoryId, name: trimmed, fixed: false }]);
   }
+
 
   function findSleepEventId() {
     const sleepEvt = events.find((e) => e.name?.trim() === "睡觉");
@@ -744,7 +852,7 @@ export default function App() {
     });
   }
 
-  // ===== Stats =====
+  // ===== Stats: day =====
   const dayStats = useMemo(() => {
     if (!day) return [];
     const count = new Map<string, number>();
@@ -762,12 +870,104 @@ export default function App() {
       .sort((a, b) => b.minutes - a.minutes);
   }, [day, eventById, catById, isDark]);
 
+    // ✅ Day stats by Category (1st-level)
+  const dayCatStats = useMemo(() => {
+    if (!day) return [];
+    const count = new Map<string, number>(); // categoryId -> slots
+    for (const eid of day.slots) {
+      if (!eid) continue;
+      const ev = eventById.get(eid);
+      if (!ev) continue;
+      count.set(ev.categoryId, (count.get(ev.categoryId) ?? 0) + 1);
+    }
+
+    return Array.from(count.entries())
+      .map(([catId, slots]) => {
+        const catName = catById.get(catId)?.name ?? "未分类";
+        const minutes = slots * SLOT_MINUTES;
+        return { catId, label: catName, minutes, color: segmentAccentColor(catName, isDark) };
+      })
+      .sort((a, b) => b.minutes - a.minutes);
+  }, [day, eventById, catById, isDark]);
+
+  const filteredDayStats = useMemo(() => {
+    if (!statsCatFilter) return dayStats;
+    return dayStats.filter((x) => {
+      const ev = eventById.get(x.eventId);
+      return ev?.categoryId === statsCatFilter;
+    });
+  }, [dayStats, statsCatFilter, eventById]);
+
+
   const donutItems = useMemo(() => {
     const top = dayStats.slice(0, 6).map((x) => ({ label: x.label, value: x.minutes, color: x.color }));
     const rest = dayStats.slice(6).reduce((s, x) => s + x.minutes, 0);
     if (rest > 0) top.push({ label: "其他", value: rest, color: isDark ? "#6b7280" : "#9ca3af" });
     return top;
   }, [dayStats, isDark]);
+
+  // ===== Stats: week =====
+  const [weekStats, setWeekStats] = useState<{ label: string; minutes: number; color: string }[]>([]);
+  const [weekTotalMinutes, setWeekTotalMinutes] = useState(0);
+  const [weekBars, setWeekBars] = useState<{ dateKey: string; total: number; parts: { label: string; minutes: number; color: string }[] }[]>([]);
+
+  useEffect(() => {
+    if (tab !== "stats") return;
+    (async () => {
+      const startKey = getWeekStartKey(dateKey);
+      const keys = Array.from({ length: 7 }, (_, i) => addDays(startKey, i));
+      const days = await Promise.all(keys.map((k) => loadOrInitDay(k)));
+
+      // week aggregate
+      const count = new Map<string, number>();
+      for (const d of days) {
+        for (const eid of d.slots) {
+          if (!eid) continue;
+          count.set(eid, (count.get(eid) ?? 0) + 1);
+        }
+      }
+
+      const rows = Array.from(count.entries())
+        .map(([eid, slots]) => {
+          const ev = eventById.get(eid);
+          const catName = ev ? catById.get(ev.categoryId)?.name : undefined;
+          const label = ev ? formatEventLabel(ev, catName) : "（已删除）";
+          const minutes = slots * SLOT_MINUTES;
+          return { label, minutes, color: segmentAccentColor(label, isDark) };
+        })
+        .sort((a, b) => b.minutes - a.minutes);
+
+      setWeekStats(rows);
+      setWeekTotalMinutes(rows.reduce((s, x) => s + x.minutes, 0));
+
+      // per-day stacked bars (top 4 + other)
+      const perDay = days.map((d, idx) => {
+        const c = new Map<string, number>();
+        for (const eid of d.slots) {
+          if (!eid) continue;
+          c.set(eid, (c.get(eid) ?? 0) + 1);
+        }
+        const items = Array.from(c.entries())
+          .map(([eid, slots]) => {
+            const ev = eventById.get(eid);
+            const catName = ev ? catById.get(ev.categoryId)?.name : undefined;
+            const label = ev ? formatEventLabel(ev, catName) : "（已删除）";
+            const minutes = slots * SLOT_MINUTES;
+            return { label, minutes, color: segmentAccentColor(label, isDark) };
+          })
+          .sort((a, b) => b.minutes - a.minutes);
+
+        const top = items.slice(0, 4);
+        const rest = items.slice(4).reduce((s, x) => s + x.minutes, 0);
+        if (rest > 0) top.push({ label: "其他", minutes: rest, color: isDark ? "rgba(255,255,255,0.22)" : "rgba(17,24,39,0.12)" });
+
+        const total = items.reduce((s, x) => s + x.minutes, 0);
+        return { dateKey: keys[idx], total, parts: top };
+      });
+
+      setWeekBars(perDay);
+    })();
+  }, [tab, dateKey, eventById, catById, isDark]);
 
   // ===== selection info =====
   const selectionInfo = useMemo(() => {
@@ -779,6 +979,25 @@ export default function App() {
     return { start, end, minutes, startTime: slotToTime(start), endTime: slotToTime(end) };
   }, [selected]);
 
+  // ===== global segments (must be BEFORE conditional return) =====
+  const globalSegments = useMemo(() => {
+    if (!day) return [];
+    const segs: { start: number; end: number; len: number; eventId: string }[] = [];
+    let i = 0;
+    while (i < TOTAL_SLOTS) {
+      const eid = day.slots[i];
+      if (!eid) {
+        i++;
+        continue;
+      }
+      let j = i + 1;
+      while (j < TOTAL_SLOTS && day.slots[j] === eid) j++;
+      segs.push({ start: i, end: j, len: j - i, eventId: eid });
+      i = j;
+    }
+    return segs;
+  }, [day]);
+
   if (!settings || !day) {
     return <div style={{ padding: 16, fontFamily: "system-ui" }}>Loading…</div>;
   }
@@ -787,19 +1006,23 @@ export default function App() {
   function getEventLabelAndSeed(eventId: string) {
     const ev = eventById.get(eventId);
     if (!ev) return { label: "（已删除）", seed: "deleted" };
-    const catName = catById.get(ev.categoryId)?.name;
-    const label = formatEventLabel(ev, catName);
-    return { label, seed: label || eventId };
+
+    // ✅ 记录页只显示二级
+    const label = (ev.name ?? "").trim() || "未命名";
+
+    // ✅ 颜色 seed 用 一级/二级（更稳定）
+    const catName = catById.get(ev.categoryId)?.name ?? "未分类";
+    const seed = `${catName}/${label}`;
+
+    return { label, seed };
   }
 
-  function isClickInsideNoClear(target: HTMLElement | null) {
-    if (!target) return false;
-    return !!target.closest("[data-noclear='true']");
-  }
 
   return (
     <div className="app-shell" style={styles.app} onPointerUp={onPointerUp} onPointerMove={onGridPointerMove}>
+      {/* Theme switch remount header (Android WebView artifact mitigation) */}
       <Header
+        key={isDark ? "dark" : "light"}
         current={tab}
         onChange={setTab}
         dateKey={dateKey}
@@ -815,8 +1038,8 @@ export default function App() {
           style={styles.page}
           onPointerDown={(e) => {
             const target = e.target as HTMLElement;
-            if (isClickInsideNoClear(target)) return; // ✅ bottom sheet / modal won't clear
-            if (target.closest("[data-slot]")) return; // clicking a cell doesn't clear
+            if (isClickInsideNoClear(target)) return;
+            if (target.closest("[data-slot]")) return;
             clearSelection();
           }}
         >
@@ -831,71 +1054,93 @@ export default function App() {
             </button>
           </div>
 
-          <div style={styles.quickRow}>
-            <div style={styles.subtle}>快速（最近）</div>
-            <div style={styles.chipsScroll} data-noclear="true">
-              {recentEvents.map((eid) => {
-                const ev = eventById.get(eid);
-                if (!ev) return null;
-                const catName = catById.get(ev.categoryId)?.name;
-                const label = formatEventLabel(ev, catName);
-                const seed = label || eid;
-                return (
-                  <button
-                    key={eid}
-                    style={{
-                      ...styles.chip,
-                      background: theme.chipBg,
-                      border: `1px solid ${theme.chipBorder}`,
-                      opacity: selected.size === 0 ? 0.7 : 1,
-                    }}
-                    disabled={selected.size === 0}
-                    onClick={() => applyEvent(eid)}
-                    title="应用到选中格子"
-                  >
-                    <span style={{ ...styles.dot, background: segmentAccentColor(seed, isDark) }} />
-                    {label || "未命名"}
-                  </button>
-                );
-              })}
-              <button style={styles.chipGhost} onClick={() => setTab("more")}>
-                管理…
-              </button>
-            </div>
-          </div>
+          {recentEvents.map((eid) => {
+          const ev = eventById.get(eid);
+          if (!ev) return null;
+
+          const catName = catById.get(ev.categoryId)?.name ?? "未分类";
+
+          // ✅ 显示：优先二级；没有二级就显示一级
+          const shortLabel = ev.name && ev.name.trim() ? ev.name.trim() : catName;
+
+          // ✅ 颜色：用完整标签做 seed
+          const fullLabel = ev.name && ev.name.trim() ? `${catName}/${ev.name.trim()}` : catName;
+          const seed = fullLabel || eid;
+
+          return (
+            <button
+              key={eid}
+              style={{
+                ...styles.chip,
+                background: theme.chipBg,
+                border: `1px solid ${theme.chipBorder}`,
+                opacity: selected.size === 0 ? 0.7 : 1,
+              }}
+              disabled={selected.size === 0}
+              onClick={() => applyEvent(eid)}
+              title="应用到选中格子"
+            >
+              <span style={{ ...styles.dot, background: segmentAccentColor(seed, isDark) }} />
+              {shortLabel}
+            </button>
+          );
+        })}
 
           {/* Grid */}
           <div style={styles.gridWrap}>
             {gridRows.map((row, r) => {
-              // hour rail labels for this 2-hour chunk
-              const rowStartSlot = row[0]; // 2-hour start
+              const rowStart = r * 8;
+              const rowEnd = rowStart + 8;
+
+              const rowStartSlot = row[0];
               const leftHour = slotToTime(rowStartSlot);
               const rightHour = slotToTime(rowStartSlot + 4);
 
-              // segments within this row (8 columns)
-              const segments: { startCol: number; len: number; eventId: string }[] = [];
-              for (let c = 0; c < 8; c++) {
-                const slotIdx = row[c];
-                const eid = day.slots[slotIdx];
-                if (!eid) continue;
+              const showNowInThisRow = nowSlot != null && nowSlot >= rowStart && nowSlot < rowEnd;
+              const nowCol = showNowInThisRow ? nowSlot! - rowStart : 0;
+              const nowLeftPct = (nowCol / 8) * 100;
 
-                const prevEid = c > 0 ? day.slots[row[c - 1]] : null;
-                if (prevEid === eid) continue;
+              const rowSegments = globalSegments
+                .map((g) => {
+                  const start = Math.max(g.start, rowStart);
+                  const end = Math.min(g.end, rowEnd);
+                  if (start >= end) return null;
 
-                let j = c;
-                while (j < 8 && day.slots[row[j]] === eid) j++;
-                segments.push({ startCol: c, len: j - c, eventId: eid });
-              }
+                  const startCol = start - rowStart;
+                  const len = end - start;
+
+                  const isStartHere = start === g.start; // true start of global segment
+                  const isEndHere = end === g.end; // true end of global segment
+
+                  return {
+                    eventId: g.eventId,
+                    globalStart: g.start,
+                    globalEnd: g.end,
+                    totalLen: g.len,
+                    startCol,
+                    len,
+                    isStartHere,
+                    isEndHere,
+                  };
+                })
+                .filter(Boolean) as {
+                eventId: string;
+                globalStart: number;
+                globalEnd: number;
+                totalLen: number;
+                startCol: number;
+                len: number;
+                isStartHere: boolean;
+                isEndHere: boolean;
+              }[];
 
               return (
                 <div key={r} style={styles.rowWrap}>
-                  {/* Hour rail (never covered) */}
                   <div style={styles.hourRail} data-noclear="true">
                     <div style={styles.hourTick}>{leftHour}</div>
                     <div style={styles.hourTickRight}>{rightHour}</div>
                   </div>
 
-                  {/* Grid row */}
                   <div style={styles.gridRow}>
                     {row.map((slotIdx) => {
                       const isSel = selected.has(slotIdx);
@@ -904,27 +1149,42 @@ export default function App() {
                           key={slotIdx}
                           data-slot={slotIdx}
                           onPointerDown={(e) => onCellPointerDown(e, slotIdx)}
-                          onClick={() => onCellTapToggle(slotIdx)}
                           style={{
                             ...styles.cell,
                             background: isSel ? theme.blue : theme.panel,
                             borderColor: isSel ? theme.blueLine : theme.hairline,
+                            transform: isSel ? "scale(0.985)" : "scale(1)",
                           }}
                         />
                       );
                     })}
 
-                    {/* Segment blocks overlay */}
                     <div style={styles.rowOverlay}>
-                      {segments.map((seg, idx) => {
+                      {/* now indicator */}
+                      {showNowInThisRow && (
+                        <>
+                          <div style={{ ...styles.nowLine, left: `calc(${nowLeftPct}% + 6px)` }} />
+                          <div style={{ ...styles.nowDot, left: `calc(${nowLeftPct}% + 6px)` }} />
+                        </>
+                      )}
+
+                      {/* Segment blocks */}
+                      {rowSegments.map((seg, idx) => {
                         const { label, seed } = getEventLabelAndSeed(seg.eventId);
-                        const minutes = seg.len * SLOT_MINUTES;
+                        const minutes = seg.totalLen * SLOT_MINUTES;
 
                         const leftPct = (seg.startCol / 8) * 100;
                         const widthPct = (seg.len / 8) * 100;
 
                         const fill = segmentFillColor(seed, isDark);
                         const accent = segmentAccentColor(seed, isDark);
+
+                        // ✅ Multi-row bar: only true start and true end are rounded; middle connections are flat.
+                        const R = 14;
+                        const roundLeft = seg.isStartHere ? R : 0;
+                        const roundRight = seg.isEndHere ? R : 0;
+
+                        const showTextHere = seg.isStartHere; // only first row show text
 
                         return (
                           <div
@@ -934,13 +1194,19 @@ export default function App() {
                               left: `calc(${leftPct}% + 6px)`,
                               width: `calc(${widthPct}% - 12px)`,
                               background: fill,
+                              borderTopLeftRadius: roundLeft,
+                              borderBottomLeftRadius: roundLeft,
+                              borderTopRightRadius: roundRight,
+                              borderBottomRightRadius: roundRight,
                             }}
                           >
                             <div style={{ ...styles.segDot, background: accent }} />
-                            <div style={styles.segBlockText}>
-                              {label}
-                              <span style={styles.segBlockMeta}> · {minutes}m</span>
-                            </div>
+                            {showTextHere && (
+                              <div style={styles.segBlockText}>
+                                {label}
+                                <span style={styles.segBlockMeta}> · {minutes}m</span>
+                              </div>
+                            )}
                             <div style={styles.segBlockInnerGlow} />
                           </div>
                         );
@@ -952,10 +1218,9 @@ export default function App() {
             })}
           </div>
 
-          {/* Spacer so bottom sheet won't cover last rows */}
           <div style={{ height: 110 }} />
 
-          {/* Bottom action sheet (iOS-like) */}
+          {/* Bottom sheet */}
           {selectionInfo && (
             <div style={styles.sheetWrap} data-noclear="true">
               <div style={styles.sheetHandle} />
@@ -1011,11 +1276,7 @@ export default function App() {
               onPick={async (eventId) => {
                 await applyEvent(eventId);
                 setShowPicker(false);
-              }}
-              onPickCategoryOnly={async (categoryId) => {
-                const evtId = getOrCreateCategoryOnlyEvent(categoryId);
-                await applyEvent(evtId);
-                setShowPicker(false);
+          
               }}
               isDark={isDark}
             />
@@ -1033,37 +1294,117 @@ export default function App() {
             <div style={styles.statsGrid}>
               <div>
                 <DonutChart items={donutItems} size={220} isDark={isDark} />
+
+                {/* ✅ Day list: keep only ONE set */}
                 <div style={{ marginTop: 10, display: "grid", gap: 6 }}>
-                  {donutItems.slice(0, 6).map((it) => (
+                  {donutItems.map((it) => (
                     <div key={it.label} style={{ display: "grid", gridTemplateColumns: "14px 1fr 70px", gap: 8, alignItems: "center" }}>
                       <div style={{ width: 12, height: 12, borderRadius: 4, background: it.color }} />
                       <div style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: theme.text }}>
                         {it.label}
                       </div>
-                      <div style={{ fontSize: 13, textAlign: "right", color: theme.text, fontWeight: 900 }}>
+                      <div style={{ fontSize: 13, textAlign: "right", color: theme.text, fontWeight: 950 }}>
                         {Math.floor(it.value / 60)}h {it.value % 60}m
                       </div>
                     </div>
                   ))}
+
+                              <div style={{ height: 14 }} />
+
+            {/* ✅ 一级（宏观） */}
+            <div style={{ fontWeight: 950, marginBottom: 8, color: theme.text }}>一级分配（宏观）</div>
+            {dayCatStats.length === 0 ? (
+              <div style={styles.subtle}>今日还没有记录。</div>
+            ) : (
+              <div style={{ display: "grid", gap: 8 }}>
+                {dayCatStats.map((r) => {
+                  const active = statsCatFilter === r.catId;
+                  return (
+                    <button
+                      key={r.catId}
+                      onClick={() => setStatsCatFilter(active ? null : r.catId)}
+                      style={{
+                        ...styles.btnGhost,
+                        display: "grid",
+                        gridTemplateColumns: "14px 1fr 90px",
+                        gap: 10,
+                        alignItems: "center",
+                        textAlign: "left",
+                        background: active ? (isDark ? "rgba(255,255,255,0.06)" : "rgba(17,24,39,0.05)") : theme.panel,
+                      }}
+                    >
+                      <div style={{ width: 12, height: 12, borderRadius: 4, background: r.color }} />
+                      <div style={{ fontWeight: 950, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {r.label}
+                        {active ? "（筛选中）" : ""}
+                      </div>
+                      <div style={{ textAlign: "right", fontWeight: 950 }}>
+                        {Math.floor(r.minutes / 60)}h {r.minutes % 60}m
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            <div style={{ height: 14 }} />
+
+            {/* ✅ 二级（微观） */}
+            <div style={{ fontWeight: 950, marginBottom: 8, color: theme.text }}>
+              二级明细（微观）{statsCatFilter ? " · 已按一级筛选" : ""}
+            </div>
+            <div style={{ display: "grid", gap: 6 }}>
+              {filteredDayStats.length === 0 ? (
+                <div style={styles.subtle}>没有明细。</div>
+              ) : (
+                filteredDayStats.slice(0, 12).map((it) => (
+                  <div
+                    key={it.eventId}
+                    style={{ display: "grid", gridTemplateColumns: "14px 1fr 90px", gap: 8, alignItems: "center" }}
+                  >
+                    <div style={{ width: 12, height: 12, borderRadius: 4, background: it.color }} />
+                    <div style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: theme.text }}>
+                      {it.label}
+                    </div>
+                    <div style={{ fontSize: 13, textAlign: "right", color: theme.text, fontWeight: 900 }}>
+                      {Math.floor(it.minutes / 60)}h {it.minutes % 60}m
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
                 </div>
               </div>
+            </div>
+          </div>
 
-              <div>
-                {dayStats.length === 0 ? (
-                  <div style={styles.subtle}>今天还没有标注。</div>
-                ) : (
-                  <div style={{ display: "grid", gap: 8 }}>
-                    {dayStats.map((r) => (
-                      <div key={r.eventId} style={styles.statRow}>
-                        <div style={styles.statLabel}>{r.label}</div>
-                        <div style={styles.statValue}>
-                          {Math.floor(r.minutes / 60)}h {r.minutes % 60}m
-                        </div>
-                      </div>
-                    ))}
+          <div style={{ height: 12 }} />
+
+          <div style={styles.card}>
+            <div style={styles.cardTitle}>本周（周一～周日）</div>
+            <div style={styles.subtle}>总计：{Math.round((weekTotalMinutes / 60) * 10) / 10}h</div>
+
+            <div style={{ marginTop: 12 }}>
+              <WeekStackBar days={weekBars} isDark={isDark} />
+            </div>
+
+            <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
+              {weekStats.length === 0 ? (
+                <div style={styles.subtle}>本周还没有记录。</div>
+              ) : (
+                weekStats.slice(0, 10).map((r) => (
+                  <div key={r.label} style={styles.statRow}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, overflow: "hidden" }}>
+                      <span style={{ width: 10, height: 10, borderRadius: 4, background: r.color, flex: "0 0 auto" }} />
+                      <div style={styles.statLabel}>{r.label}</div>
+                    </div>
+                    <div style={styles.statValue}>
+                      {Math.floor(r.minutes / 60)}h {r.minutes % 60}m
+                    </div>
                   </div>
-                )}
-              </div>
+                ))
+              )}
             </div>
           </div>
         </div>
@@ -1146,7 +1487,7 @@ export default function App() {
                 return (
                   <div key={c.id} style={styles.groupCard}>
                     <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
-                      <div style={{ fontWeight: 900, color: theme.text }}>{c.name}</div>
+                      <div style={{ fontWeight: 950, color: theme.text }}>{c.name}</div>
                       <button style={styles.secondaryBtn} onClick={() => deleteCategory(c.id)}>
                         删除一级
                       </button>
@@ -1165,6 +1506,7 @@ export default function App() {
                                 color: theme.text,
                               }}
                               onClick={() => {
+                                // if there is selection -> apply, else just push into recent
                                 if (selected.size > 0) applyEvent(ev.id);
                                 else {
                                   setRecentEvents((prev) => {
@@ -1248,74 +1590,70 @@ function Header(props: {
   const { current, onChange, dateKey, onPrevDay, onNextDay, onToday, theme, isDark } = props;
 
   return (
-    <div style={{ ...headerStyles.header, background: theme.headerBg, borderBottom: `1px solid ${theme.hairline}` }} data-noclear="true">
-      <div style={headerStyles.left}>
-        {/* ✅ 更像 App 的标题（图标 + 渐变字） */}
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+    <div
+      style={{
+        ...headerStyles.header,
+        background: theme.headerBg,
+        borderBottom: `1px solid ${theme.hairline}`,
+      }}
+      data-noclear="true"
+    >
+      {/* top row */}
+      <div style={headerStyles.topRow}>
+        <div style={headerStyles.brandRow}>
           <div
             style={{
-              width: 26,
-              height: 26,
-              borderRadius: 8,
-              background: isDark ? "rgba(255,255,255,0.10)" : "rgba(17,24,39,0.08)",
+              ...headerStyles.logo,
               border: `1px solid ${theme.hairline}`,
-              display: "grid",
-              placeItems: "center",
-              boxShadow: theme.shadow,
-              fontWeight: 1000,
-              color: theme.text,
+              background: isDark ? "rgba(255,255,255,0.06)" : "rgba(17,24,39,0.04)",
             }}
-            aria-hidden="true"
           >
-            ▦
+            <div style={headerStyles.logoGrid} />
           </div>
 
-          <div
-            style={{
-              fontWeight: 1000,
-              fontSize: 18,
-              letterSpacing: -0.4,
-              background: isDark
-                ? "linear-gradient(180deg, #ffffff, rgba(255,255,255,0.60))"
-                : "linear-gradient(180deg, #0b0f17, rgba(11,15,23,0.55))",
-              WebkitBackgroundClip: "text",
-              color: "transparent",
-              lineHeight: 1,
-            }}
-          >
-            DayGrid
-            <span style={{ marginLeft: 6, fontSize: 12, color: theme.sub, fontWeight: 900 }}>15m</span>
+          <div style={headerStyles.brandLine}>
+            <span style={{ ...headerStyles.brand, color: theme.text }}>日格 DayGrid</span>
+            <span style={{ ...headerStyles.brandDot, color: theme.sub }}>·</span>
+            <span style={{ ...headerStyles.brandSub, color: theme.sub }}>让每 15 分钟更清晰</span>
           </div>
         </div>
 
-        <div style={headerStyles.dateRow}>
-          <button style={{ ...headerStyles.icon, color: theme.text, border: `1px solid ${theme.hairline}`, background: theme.panel }} onClick={onPrevDay}>
-            ◀
-          </button>
-          <div style={{ ...headerStyles.date, color: theme.text }}>{dateKey}</div>
-          <button style={{ ...headerStyles.icon, color: theme.text, border: `1px solid ${theme.hairline}`, background: theme.panel }} onClick={onNextDay}>
-            ▶
-          </button>
-          <button style={{ ...headerStyles.today, color: theme.text, border: `1px solid ${theme.hairline}`, background: theme.panel }} onClick={onToday}>
-            今日
-          </button>
+        <div
+          style={{
+            ...headerStyles.tabsWrap,
+            background: isDark ? "rgba(255,255,255,0.06)" : "rgba(17,24,39,0.05)",
+            border: `1px solid ${theme.hairline}`,
+          }}
+        >
+          <SegButton active={current === "record"} onClick={() => onChange("record")} theme={theme}>
+            记录
+          </SegButton>
+          <SegButton active={current === "stats"} onClick={() => onChange("stats")} theme={theme}>
+            统计
+          </SegButton>
+          <SegButton active={current === "more"} onClick={() => onChange("more")} theme={theme}>
+            更多
+          </SegButton>
         </div>
       </div>
 
-      <div style={{ ...headerStyles.tabsWrap, background: isDark ? "rgba(255,255,255,0.06)" : "rgba(17,24,39,0.05)", border: `1px solid ${theme.hairline}` }}>
-        <SegButton active={current === "record"} onClick={() => onChange("record")} theme={theme}>
-          记录
-        </SegButton>
-        <SegButton active={current === "stats"} onClick={() => onChange("stats")} theme={theme}>
-          统计
-        </SegButton>
-        <SegButton active={current === "more"} onClick={() => onChange("more")} theme={theme}>
-          更多
-        </SegButton>
+      {/* date row */}
+      <div style={headerStyles.dateRow}>
+        <button style={{ ...headerStyles.icon, color: theme.text, border: `1px solid ${theme.hairline}`, background: theme.panel }} onClick={onPrevDay}>
+          ◀
+        </button>
+        <div style={{ ...headerStyles.date, color: theme.text }}>{dateKey}</div>
+        <button style={{ ...headerStyles.icon, color: theme.text, border: `1px solid ${theme.hairline}`, background: theme.panel }} onClick={onNextDay}>
+          ▶
+        </button>
+        <button style={{ ...headerStyles.today, color: theme.text, border: `1px solid ${theme.hairline}`, background: theme.panel }} onClick={onToday}>
+          今日
+        </button>
       </div>
     </div>
   );
 }
+
 
 function SegButton(props: { active: boolean; onClick: () => void; children: React.ReactNode; theme: ReturnType<typeof makeThemeTokens> }) {
   const { active, onClick, children, theme } = props;
@@ -1328,6 +1666,8 @@ function SegButton(props: { active: boolean; onClick: () => void; children: Reac
         color: theme.text,
         boxShadow: active ? theme.shadow : "none",
         border: active ? `1px solid ${theme.hairline}` : "1px solid transparent",
+        transform: active ? "translateY(-0.5px)" : "translateY(0)",
+        transition: "transform 140ms ease, box-shadow 140ms ease, background 140ms ease",
       }}
     >
       {children}
@@ -1363,7 +1703,7 @@ function AddEvent({
   styles,
 }: {
   categories: Category[];
-  onAdd: (categoryId: string, name?: string) => void;
+  onAdd: (categoryId: string, name: string) => void;
   styles: Record<string, React.CSSProperties>;
 }) {
   const [categoryId, setCategoryId] = useState(categories[0]?.id ?? "");
@@ -1386,14 +1726,20 @@ function AddEvent({
         </select>
       </div>
       <div style={{ display: "flex", gap: 10 }}>
-        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="如：PPT（可留空）" style={styles.input} />
+        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="如：PPT" style={styles.input} />
         <button
           style={styles.primaryBtn}
           onClick={() => {
-            if (!categoryId) return;
-            onAdd(categoryId, name);
-            setName("");
-          }}
+          if (!categoryId) return;
+          const trimmed = name.trim();
+          if (!trimmed) {
+            alert("请填写二级名称（必填）");
+            return;
+          }
+          onAdd(categoryId, trimmed);
+          setName("");
+        }}
+
         >
           添加
         </button>
@@ -1410,21 +1756,14 @@ function makeStyles(theme: ReturnType<typeof makeThemeTokens>, isDark: boolean) 
       fontFamily: font,
       background: theme.bg,
       color: theme.text,
-
       minHeight: "100dvh",
       height: "100dvh",
       width: "100vw",
       maxWidth: "100vw",
-
       overflowY: "auto",
       overflowX: "hidden",
-
       padding: 0,
       margin: 0,
-
-      // ✅ Safe area 兜底（让顶部不被状态栏压住）
-      paddingTop: "env(safe-area-inset-top, 0px)",
-
       WebkitOverflowScrolling: "touch",
     },
 
@@ -1452,14 +1791,17 @@ function makeStyles(theme: ReturnType<typeof makeThemeTokens>, isDark: boolean) 
       gap: 14,
     },
 
-    quickRow: { display: "flex", gap: 10, alignItems: "center", marginTop: 10 },
+    quickRow: { display: "grid", gridTemplateColumns: "42px 1fr", gap: 10, alignItems: "center", marginTop: 10 },
 
-    chipsScroll: { display: "flex", gap: 10, overflowX: "auto", paddingBottom: 6 },
+    quickTitle: { color: theme.sub, fontSize: 13, fontWeight: 900, whiteSpace: "nowrap" },
+
+    chipsScroll: { display: "flex", gap: 10, overflowX: "auto", paddingBottom: 6, WebkitOverflowScrolling: "touch" },
+
 
     dot: { width: 10, height: 10, borderRadius: 999, display: "inline-block", marginRight: 8 },
 
     chip: {
-      padding: "9px 11px",
+      padding: "8px 10px",      // 原来 9px 11px
       borderRadius: 999,
       cursor: "pointer",
       whiteSpace: "nowrap",
@@ -1467,7 +1809,10 @@ function makeStyles(theme: ReturnType<typeof makeThemeTokens>, isDark: boolean) 
       display: "inline-flex",
       alignItems: "center",
       color: theme.text,
+      fontSize: 13,             // 新增：略小
     },
+  
+
 
     chipGhost: {
       padding: "9px 11px",
@@ -1534,9 +1879,9 @@ function makeStyles(theme: ReturnType<typeof makeThemeTokens>, isDark: boolean) 
       minHeight: 44,
       cursor: "pointer",
       userSelect: "none",
-
-      // ✅ 关键：允许纵向滚动
       touchAction: "pan-y",
+      transition: "background 120ms ease, border-color 120ms ease, transform 120ms ease",
+      willChange: "transform",
     },
 
     rowOverlay: {
@@ -1546,11 +1891,35 @@ function makeStyles(theme: ReturnType<typeof makeThemeTokens>, isDark: boolean) 
       zIndex: 2,
     },
 
+    nowLine: {
+      position: "absolute" as const,
+      top: 6,
+      bottom: 6,
+      width: 2,
+      transform: "translateX(-50%)",
+      background: isDark ? "rgba(255,59,48,0.85)" : "rgba(255,59,48,0.78)",
+      borderRadius: 999,
+      boxShadow: isDark ? "0 6px 18px rgba(255,59,48,0.18)" : "0 6px 18px rgba(255,59,48,0.12)",
+      zIndex: 10,
+      pointerEvents: "none" as const,
+    },
+
+    nowDot: {
+      position: "absolute" as const,
+      width: 8,
+      height: 8,
+      borderRadius: 999,
+      top: 10,
+      transform: "translate(-50%, 0)",
+      background: isDark ? "rgba(255,59,48,0.95)" : "rgba(255,59,48,0.9)",
+      zIndex: 11,
+      pointerEvents: "none" as const,
+    },
+
     segBlock: {
       position: "absolute" as const,
       top: 6,
       bottom: 6,
-      borderRadius: 14,
       overflow: "hidden",
       display: "flex",
       alignItems: "center",
@@ -1558,6 +1927,9 @@ function makeStyles(theme: ReturnType<typeof makeThemeTokens>, isDark: boolean) 
       gap: 8,
       boxShadow: isDark ? "0 10px 22px rgba(0,0,0,0.38)" : "0 10px 16px rgba(0,0,0,0.056)",
       border: `1px solid ${isDark ? "rgba(255,255,255,0.10)" : "rgba(17,24,39,0.10)"}`,
+      transition: "transform 140ms ease, opacity 140ms ease",
+      willChange: "transform, opacity",
+      zIndex: 4,
     },
 
     segBlockInnerGlow: {
@@ -1597,7 +1969,6 @@ function makeStyles(theme: ReturnType<typeof makeThemeTokens>, isDark: boolean) 
       marginLeft: 2,
     },
 
-    // iOS-like bottom sheet
     sheetWrap: {
       position: "fixed" as const,
       left: 12,
@@ -1610,6 +1981,8 @@ function makeStyles(theme: ReturnType<typeof makeThemeTokens>, isDark: boolean) 
       boxShadow: isDark ? "0 22px 60px rgba(0,0,0,0.70)" : "0 22px 60px rgba(0,0,0,0.18)",
       border: `1px solid ${theme.hairline}`,
       backdropFilter: "blur(12px)",
+      WebkitBackdropFilter: "blur(12px)",
+      transform: "translateZ(0)",
     },
 
     sheetHandle: {
@@ -1750,25 +2123,57 @@ const headerStyles: Record<string, React.CSSProperties> = {
     position: "sticky",
     top: 0,
     zIndex: 50,
-
-    // ✅ Safe Area：顶部留白，避免被状态栏遮挡
-    paddingTop: "calc(env(safe-area-inset-top, 0px) + 10px)",
-
-    paddingRight: 12,
-    paddingLeft: 12,
-    paddingBottom: 12,
-
-    margin: "0 0 12px 0",
+    padding: `calc(6px + env(safe-area-inset-top, 0px)) 12px 10px 12px`,
+    margin: "0 0 8px 0",
     width: "100%",
     boxSizing: "border-box",
     backdropFilter: "blur(14px)",
+    WebkitBackdropFilter: "blur(14px)",
+    display: "grid",
+    gap: 8,
+  },
+
+  topRow: {
     display: "flex",
     justifyContent: "space-between",
     alignItems: "center",
     gap: 12,
     flexWrap: "wrap",
   },
-  left: { display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" },
+
+  brandRow: { display: "flex", alignItems: "center", gap: 10, minWidth: 0 },
+
+  logo: {
+    width: 32,
+    height: 32,
+    borderRadius: 12,
+    display: "grid",
+    placeItems: "center",
+    overflow: "hidden",
+    flex: "0 0 auto",
+  },
+  logoGrid: {
+    width: 16,
+    height: 16,
+    borderRadius: 6,
+    background:
+      "repeating-linear-gradient(0deg, rgba(0,0,0,0.12), rgba(0,0,0,0.12) 1px, transparent 1px, transparent 4px), repeating-linear-gradient(90deg, rgba(0,0,0,0.12), rgba(0,0,0,0.12) 1px, transparent 1px, transparent 4px)",
+    opacity: 0.7,
+  },
+
+  brandLine: {
+    display: "flex",
+    alignItems: "baseline",
+    gap: 6,
+    minWidth: 0,
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  brand: { fontWeight: 1000, fontSize: 18, letterSpacing: -0.4 },
+  brandDot: { fontWeight: 900, opacity: 0.6 },
+  brandSub: { fontWeight: 850, fontSize: 13, opacity: 0.9 },
+
   dateRow: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" },
   icon: { width: 34, height: 34, borderRadius: 12, cursor: "pointer", fontWeight: 950 },
   today: { height: 34, borderRadius: 12, cursor: "pointer", fontWeight: 950, padding: "0 10px" },
@@ -1780,6 +2185,7 @@ const headerStyles: Record<string, React.CSSProperties> = {
     alignItems: "center",
     padding: 6,
     borderRadius: 999,
+    flex: "0 0 auto",
   },
   segBtn: {
     height: 34,
@@ -1789,3 +2195,4 @@ const headerStyles: Record<string, React.CSSProperties> = {
     fontWeight: 950,
   },
 };
+
