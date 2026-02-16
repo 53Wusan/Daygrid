@@ -41,8 +41,6 @@ const DRAG_START_PX = 6;
 const AXIS_LOCK_RATIO = 1.2;
 const SCROLL_CANCEL_PX = 8;
 
-const SCROLL_DY = 10;
-
 const store = localforage.createInstance({ name: "daygrid" });
 
 function pad2(n: number) {
@@ -757,10 +755,6 @@ useEffect(() => {
     saveSettings(settings).catch(() => {});
   }, [settings]);
 
-  function shouldTreatAsScroll(dx: number, dy: number) {
-    return Math.abs(dy) > SCROLL_DY && Math.abs(dy) > Math.abs(dx) * 1.1;
-  }
-
   async function hapticLight() {
     try {
       await Haptics.impact({ style: ImpactStyle.Light });
@@ -841,7 +835,7 @@ useEffect(() => {
     selectRange(g.startSlot, slot);
   }
 
-  function onPointerUp(e?: React.PointerEvent) {
+  function onPointerUp() {
     const g = gestureRef.current;
     if (!g) return;
     gestureRef.current = null;
@@ -1210,12 +1204,6 @@ useEffect(() => {
   }, [monthTotalsByDay]);
 
   // ===== Record page helper =====
-  function getSegStyle(eventId: string) {
-    const ev = eventById.get(eventId);
-    if (!ev) return { fill: isDark ? "rgba(255,255,255,0.10)" : "rgba(17,24,39,0.08)", accent: isDark ? "rgba(255,255,255,0.45)" : "rgba(17,24,39,0.45)" };
-    return eventColorFamily(ev.categoryId, ev.id, isDark);
-  }
-
   const ready = !!settings && !!day;
   const showBoot = !ready || booting;
 
