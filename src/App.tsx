@@ -8,20 +8,17 @@ import { Haptics, ImpactStyle } from "@capacitor/haptics";
  * - Events rendered as segments overlay
  * - Interaction:
  *   - Tap selects SINGLE slot (always replaces previous selection, closes modal)
- *   - Long-press enters range-select; drag updates range (also replaces selection)
- *   - Scroll intent gate to reduce accidental selection
- * - Local persistence + recent + fixed copy + stats day/week + import/export
- * - Fixes & Improvements:
- *   1) Header safe-area tuned (avoid excessive blank)
- *   2) Week stats Monday–Sunday + visualization (WeekStackBar)
- *   3) Theme switch header artifact mitigation (key remount)
- *   4) Reduce scroll mis-tap (strict tap: pointerup on same slot)
- *   5) Modal click outside to close
- *   6) Selection is always "reselect" (no non-contiguous / additive selection)
+ *   - Horizontal drag selects range (no long-press required)
+ *   - Vertical move becomes scroll (doesn't trigger selection)
+ * - Local persistence + recent + fixed copy + stats day/week/month + overview + import/export
+ * - Calendarist-style color family:
+ *   - Category has stable hue
+ *   - Events under same category vary by lightness/saturation
  */
 
 type Tab = "record" | "stats" | "more";
 type ThemeMode = "system" | "light" | "dark";
+type StatsMode = "overview" | "day" | "week" | "month";
 
 type Category = { id: string; name: string };
 type EventTag = { id: string; categoryId: string; name?: string; fixed?: boolean };
@@ -39,14 +36,11 @@ const TOTAL_SLOTS = 96;
 const START_HOUR = 8; // timeline starts at 08:00
 const RECENT_LIMIT = 8;
 
-// Tap vs scroll tuning (make tap stricter to reduce accidental selection)
-const TAP_MAX_MS = 230;
-const TAP_MAX_MOVE = 6; // px
+// gesture tuning
+const DRAG_START_PX = 6;
+const AXIS_LOCK_RATIO = 1.2;
+const SCROLL_CANCEL_PX = 8;
 
-// Long press to enable drag-range select
-const LONG_PRESS_MS = 260;
-
-// Scroll intent
 const SCROLL_DY = 10;
 
 const store = localforage.createInstance({ name: "daygrid" });
@@ -88,20 +82,83 @@ function getWeekStartKey(dateKey: string) {
   return toDateKey(dt);
 }
 
-function colorForSeed(seed: string) {
-  let hash = 0;
-  for (let i = 0; i < seed.length; i++) hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
-  return hash % 360;
+function getMonthStartKey(dateKey: string) {
+  const [y, m] = dateKey.split("-").map(Number);
+  const dt = new Date(y, m - 1, 1);
+  return toDateKey(dt);
 }
-function segmentFillColor(seed: string, isDark: boolean) {
-  const hue = colorForSeed(seed);
-  if (isDark) return `hsla(${hue} 55% 22% / 0.98)`;
-  return `hsla(${hue} 75% 92% / 1)`;
+function getDaysInMonth(dateKey: string) {
+  const [y, m] = dateKey.split("-").map(Number);
+  return new Date(y, m, 0).getDate(); // last day of month
 }
-function segmentAccentColor(seed: string, isDark: boolean) {
-  const hue = colorForSeed(seed);
-  if (isDark) return `hsla(${hue} 75% 62% / 1)`;
-  return `hsla(${hue} 70% 45% / 1)`;
+function getMonthKeys(dateKey: string) {
+  const start = getMonthStartKey(dateKey);
+  const n = getDaysInMonth(dateKey);
+  return Array.from({ length: n }, (_, i) => addDays(start, i));
+}
+
+function dayKeyToDate(dateKey: string) {
+  const [y, m, d] = dateKey.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
+/** ===== Calendarist-like color family ===== */
+function hash01(seed: string) {
+  let h = 2166136261;
+  for (let i = 0; i < seed.length; i++) h = (h ^ seed.charCodeAt(i)) * 16777619;
+  return ((h >>> 0) % 10000) / 10000; // 0~1
+}
+function categoryHue(categoryId: string) {
+  return Math.floor(hash01(categoryId) * 360);
+}
+function categoryAccent(categoryId: string, isDark: boolean) {
+  const hue = categoryHue(categoryId);
+  const s = isDark ? 70 : 72;
+  const l = isDark ? 62 : 45;
+  return `hsl(${hue} ${s}% ${l}%)`;
+}
+function clamp01(x: number) {
+  return Math.max(0, Math.min(1, x));
+}
+
+function hashTo01(str: string) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return ((h >>> 0) % 10000) / 10000;
+}
+
+function hsl(h: number, s: number, l: number, a = 1) {
+  return `hsla(${Math.round(h)}, ${Math.round(s)}%, ${Math.round(l)}%, ${a})`;
+}
+
+/* ✅ 方案 A：一级同色系，二级明显阶梯区分 */
+function eventColorFamily(categoryId: string, eventId: string, isDark: boolean) {
+  // 一级决定主色相（同色系）
+  const baseHue = Math.floor(hashTo01(categoryId) * 360);
+
+  // 二级：在同色系里做“轻微色相偏移”，确保肉眼可见
+  const hueOffset = Math.round((hashTo01(eventId) - 0.5) * 36); // -18 ~ +18
+  const hue = (baseHue + hueOffset + 360) % 360;
+
+  // 二级：再加亮度阶梯，让差异更稳定
+  const tier = Math.floor(hashTo01("tier:" + eventId) * 6); // 0~5
+
+  // Accent（小圆点/强调色）更明显
+  const sAccent = isDark ? 78 : 86;
+  const lAccentBase = isDark ? 56 : 40;
+  const lAccent = lAccentBase + tier * (isDark ? 4 : 5);
+  const accent = hsl(hue, sAccent, clamp01(lAccent / 100) * 100, 0.95);
+
+  // Fill（块背景）更淡，但也跟随 tier 变化
+  const sFill = isDark ? 55 : 62;
+  const lFillBase = isDark ? 22 : 92;
+  const lFill = lFillBase - tier * (isDark ? 1.3 : 1.7);
+  const fill = hsl(hue, sFill, clamp01(lFill / 100) * 100, isDark ? 0.55 : 0.88);
+
+  return { fill, accent };
 }
 
 function formatEventLabel(ev: EventTag | undefined, catName: string | undefined) {
@@ -144,7 +201,7 @@ async function loadMeta() {
 
   const categories = (await store.getItem<Category[]>("categories")) ?? defaultCategories;
   const events = (await store.getItem<EventTag[]>("events")) ?? defaultEvents;
-  
+
   const recent =
     (await store.getItem<string[]>("recentEvents")) ??
     ["evt_life_sleep", "evt_life_eat", "evt_life_commute", "evt_study_english", "evt_work_only"];
@@ -229,6 +286,111 @@ function DonutChart(props: { items: { label: string; value: number; color: strin
   );
 }
 
+// 加载loading界面
+function BootScreen(props: { isDark: boolean; title?: string; subtitle?: string }) {
+  const { isDark } = props;
+  const bg = isDark ? "#000000" : "#f5f5f7";
+  const panel = isDark ? "rgba(255,255,255,0.06)" : "rgba(17,24,39,0.05)";
+  const text = isDark ? "#f9fafb" : "#111827";
+  const sub = isDark ? "#9ca3af" : "#6b7280";
+  const border = isDark ? "rgba(255,255,255,0.12)" : "rgba(17,24,39,0.10)";
+
+  return (
+    <div
+      style={{
+        minHeight: "100dvh",
+        height: "100dvh",
+        display: "grid",
+        placeItems: "center",
+        background: bg,
+        color: text,
+        padding: 18,
+        fontFamily: `system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial`,
+      }}
+    >
+      <div
+        style={{
+          width: "min(520px, 94vw)",
+          borderRadius: 26,
+          padding: 18,
+          border: `1px solid ${border}`,
+          background: panel,
+          boxShadow: isDark ? "0 20px 80px rgba(0,0,0,0.65)" : "0 20px 80px rgba(0,0,0,0.12)",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          <div
+            style={{
+              width: 46,
+              height: 46,
+              borderRadius: 16,
+              border: `1px solid ${border}`,
+              background: isDark ? "rgba(255,255,255,0.06)" : "rgba(255,255,255,0.92)",
+              display: "grid",
+              placeItems: "center",
+              overflow: "hidden",
+            }}
+          >
+            <div
+              style={{
+                width: 26,
+                height: 26,
+                borderRadius: 8,
+                background: isDark ? "rgba(255,255,255,0.08)" : "rgba(17,24,39,0.06)",
+                position: "relative",
+              }}
+            >
+              <div
+                style={{
+                  position: "absolute",
+                  inset: 0,
+                  backgroundImage:
+                    "linear-gradient(to right, rgba(127,127,127,0.25) 1px, transparent 1px), linear-gradient(to bottom, rgba(127,127,127,0.25) 1px, transparent 1px)",
+                  backgroundSize: "6px 6px",
+                }}
+              />
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gap: 2 }}>
+            <div style={{ fontSize: 18, fontWeight: 1000, letterSpacing: -0.2 }}>{props.title ?? "日格 DayGrid"}</div>
+            <div style={{ fontSize: 13, color: sub, fontWeight: 900 }}>{props.subtitle ?? "让每 15 分钟更清晰"}</div>
+          </div>
+        </div>
+
+        <div style={{ height: 14 }} />
+
+        <div
+          style={{
+            height: 10,
+            borderRadius: 999,
+            background: isDark ? "rgba(255,255,255,0.08)" : "rgba(17,24,39,0.06)",
+            overflow: "hidden",
+          }}
+        >
+          <div
+            style={{
+              height: "100%",
+              width: "45%",
+              background: isDark
+                ? "linear-gradient(90deg, transparent, rgba(255,255,255,0.12), transparent)"
+                : "linear-gradient(90deg, transparent, rgba(17,24,39,0.10), transparent)",
+              animation: "dg_shimmer 1.1s ease-in-out infinite",
+            }}
+          />
+        </div>
+
+        <style>{`
+          @keyframes dg_shimmer {
+            0% { transform: translateX(-60%); }
+            100% { transform: translateX(240%); }
+          }
+        `}</style>
+      </div>
+    </div>
+  );
+}
+
 /** ===== Week visualization ===== */
 function WeekStackBar(props: {
   days: { dateKey: string; total: number; parts: { label: string; minutes: number; color: string }[] }[];
@@ -238,7 +400,10 @@ function WeekStackBar(props: {
   return (
     <div style={{ display: "grid", gap: 10 }}>
       {props.days.map((d) => (
-        <div key={d.dateKey} style={{ display: "grid", gridTemplateColumns: "86px 1fr 54px", gap: 10, alignItems: "center" }}>
+        <div
+          key={d.dateKey}
+          style={{ display: "grid", gridTemplateColumns: "86px 1fr 54px", gap: 10, alignItems: "center" }}
+        >
           <div style={{ fontWeight: 950, opacity: 0.75 }}>{d.dateKey.slice(5)}</div>
 
           <div
@@ -257,9 +422,7 @@ function WeekStackBar(props: {
             })}
           </div>
 
-          <div style={{ textAlign: "right", fontWeight: 950, opacity: 0.75 }}>
-            {Math.round((d.total / 60) * 10) / 10}h
-          </div>
+          <div style={{ textAlign: "right", fontWeight: 950, opacity: 0.75 }}>{Math.round((d.total / 60) * 10) / 10}h</div>
         </div>
       ))}
     </div>
@@ -287,15 +450,8 @@ function EventPickerModal(props: {
   const chipBg = isDark ? "rgba(255,255,255,0.06)" : "rgba(255,255,255,0.92)";
 
   return (
-    <div
-      style={{ ...modalStyles.backdrop, background: bg }}
-      data-noclear="true"
-      onPointerDown={onClose} // click outside to close
-    >
-      <div
-        style={{ ...modalStyles.modal, background: panel, border: `1px solid ${border}` }}
-        onPointerDown={(e) => e.stopPropagation()}
-      >
+    <div style={{ ...modalStyles.backdrop, background: bg }} data-noclear="true" onPointerDown={onClose}>
+      <div style={{ ...modalStyles.modal, background: panel, border: `1px solid ${border}` }} onPointerDown={(e) => e.stopPropagation()}>
         <div style={modalStyles.header}>
           <div style={{ fontWeight: 950, color: text, fontSize: 16 }}>选择事件</div>
           <button style={{ ...modalStyles.closeBtn, border: `1px solid ${border}`, color: text, background: chipBg }} onClick={onClose}>
@@ -336,7 +492,7 @@ function EventPickerModal(props: {
                   background: isDark ? "rgba(255,255,255,0.03)" : "rgba(17,24,39,0.03)",
                 }}
               >
-      
+                <div style={{ fontWeight: 950, color: text }}>{c.name}</div>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 }}>
                   {evs
                     .filter((e) => e.name && e.name.trim() !== "")
@@ -385,7 +541,6 @@ const modalStyles: Record<string, React.CSSProperties> = {
   closeBtn: { borderRadius: 14, cursor: "pointer", width: 36, height: 36, display: "grid", placeItems: "center" },
   chip: { borderRadius: 999, padding: "9px 11px", cursor: "pointer", fontWeight: 900 },
   group: { borderRadius: 18, padding: 10, marginTop: 10 },
-  groupHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 },
   smallBtn: { borderRadius: 14, padding: "10px 12px", cursor: "pointer", fontWeight: 900 },
 };
 
@@ -420,11 +575,68 @@ function makeThemeTokens(isDark: boolean) {
   return isDark ? dark : light;
 }
 
+/** ===== Aggregation helpers (Day/Week/Month/Overview) ===== */
+type Agg = {
+  totalMinutes: number;
+  byCat: Map<string, number>;
+  byEvent: Map<string, number>;
+};
+
+function aggregateDays(
+  days: Array<DayLog | null | undefined>,
+  eventById: Map<string, EventTag>
+) {
+  // ✅ 任何 null/undefined 都跳过，避免读取 slots 报错
+  const byEventSlots = new Map<string, number>(); // eventId -> slots
+  const byCatSlots = new Map<string, number>(); // categoryId -> slots
+  let totalSlots = 0;
+
+  for (const d of days) {
+    if (!d || !Array.isArray(d.slots)) continue;
+
+    for (const eid of d.slots) {
+      if (!eid) continue;
+
+      totalSlots += 1;
+      byEventSlots.set(eid, (byEventSlots.get(eid) ?? 0) + 1);
+
+      const ev = eventById.get(eid);
+      const catId = ev?.categoryId ?? "cat_deleted";
+      byCatSlots.set(catId, (byCatSlots.get(catId) ?? 0) + 1);
+    }
+  }
+
+  // ✅ 把 slots -> minutes
+  const byEvent = new Map<string, number>();
+  for (const [id, slots] of byEventSlots.entries()) byEvent.set(id, slots * SLOT_MINUTES);
+
+  const byCat = new Map<string, number>();
+  for (const [id, slots] of byCatSlots.entries()) byCat.set(id, slots * SLOT_MINUTES);
+
+  return {
+    totalMinutes: totalSlots * SLOT_MINUTES,
+    byEvent,
+    byCat,
+  };
+}
+
+
+
+function topNFromMap(map: Map<string, number>, n: number) {
+  return Array.from(map.entries())
+    .map(([id, minutes]) => ({ id, minutes }))
+    .sort((a, b) => b.minutes - a.minutes)
+    .slice(0, n);
+}
+
 /** ===== App ===== */
 export default function App() {
   const [tab, setTab] = useState<Tab>("record");
+  const [statsMode, setStatsMode] = useState<StatsMode>("overview");
+
   const [dateKey, setDateKey] = useState<string>(toDateKey());
   const [day, setDay] = useState<DayLog | null>(null);
+
   const [statsCatFilter, setStatsCatFilter] = useState<string | null>(null);
 
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -436,23 +648,18 @@ export default function App() {
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const anchorRef = useRef<number | null>(null);
 
-  // tap handling (reduce accidental selection while scrolling)
-  const tapRef = useRef<{ t: number; x: number; y: number; slot: number } | null>(null);
-  const lastMoveRef = useRef<{ x: number; y: number } | null>(null);
-  const downSlotRef = useRef<number | null>(null); // strict tap: pointerup must be on same slot
+  const gestureRef = useRef<{
+    active: boolean;
+    pointerId: number;
+    startX: number;
+    startY: number;
+    startSlot: number;
+    mode: "pending" | "hdrag" | "scroll";
+    pressEl: HTMLElement | null;
+  } | null>(null);
 
-  // long press + drag-range
-  const longPressTimerRef = useRef<number | null>(null);
-  const longPressArmedRef = useRef(false);
-  const draggedRef = useRef(false);
-  const pressSlotRef = useRef<{ start: number } | null>(null);
-
-  // scrolling intent gate
-  const isScrollingRef = useRef(false);
-  const startPtRef = useRef<{ x: number; y: number } | null>(null);
-
-  // Picker modal
   const [showPicker, setShowPicker] = useState(false);
+  const [booting, setBooting] = useState(true);
 
   // system dark detection
   const [systemDark, setSystemDark] = useState(false);
@@ -473,7 +680,7 @@ export default function App() {
   const eventById = useMemo(() => new Map(events.map((e) => [e.id, e])), [events]);
   const catById = useMemo(() => new Map(categories.map((c) => [c.id, c])), [categories]);
 
-  // grid: 12 rows x 8 columns (2h per row)
+  // grid: 12 rows x 8 columns
   const gridRows = useMemo(() => Array.from({ length: 12 }, (_, r) => Array.from({ length: 8 }, (_, c) => r * 8 + c)), []);
 
   // now indicator
@@ -515,13 +722,28 @@ export default function App() {
       setSelected(new Set());
       anchorRef.current = null;
       setShowPicker(false);
-      draggedRef.current = false;
-      pressSlotRef.current = null;
       setStatsCatFilter(null);
-      longPressArmedRef.current = false;
-      isScrollingRef.current = false;
+      gestureRef.current = null;
     })();
   }, [dateKey]);
+
+  // loading（只要 settings + day 准备好，就自动退出）
+useEffect(() => {
+  if (!settings || !day) return;
+
+  // 如果已经退出过 loading，就不再进入
+  setBooting((prev) => {
+    if (!prev) return prev;
+    return true;
+  });
+
+  const t = window.setTimeout(() => {
+    setBooting(false);
+  }, 120);
+
+  return () => window.clearTimeout(t);
+}, [settings, day]);
+
 
   // persist meta
   useEffect(() => {
@@ -534,13 +756,6 @@ export default function App() {
     if (!settings) return;
     saveSettings(settings).catch(() => {});
   }, [settings]);
-
-  function cancelLongPressTimer() {
-    if (longPressTimerRef.current != null) {
-      window.clearTimeout(longPressTimerRef.current);
-      longPressTimerRef.current = null;
-    }
-  }
 
   function shouldTreatAsScroll(dx: number, dy: number) {
     return Math.abs(dy) > SCROLL_DY && Math.abs(dy) > Math.abs(dx) * 1.1;
@@ -574,116 +789,62 @@ export default function App() {
   }
 
   function onCellPointerDown(e: React.PointerEvent, startSlot: number) {
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-
-    // ✅ Every pointer down is a "reselect" (as per latest requirement)
     setShowPicker(false);
-    draggedRef.current = false;
-    longPressArmedRef.current = false;
-    isScrollingRef.current = false;
-
-    // reset tap/scroll refs
-    tapRef.current = { t: Date.now(), x: e.clientX, y: e.clientY, slot: startSlot };
-    lastMoveRef.current = { x: e.clientX, y: e.clientY };
-    startPtRef.current = { x: e.clientX, y: e.clientY };
-    downSlotRef.current = startSlot;
-
-    // selection base
     anchorRef.current = startSlot;
-    pressSlotRef.current = { start: startSlot };
     setSelected(new Set([startSlot]));
 
-    cancelLongPressTimer();
-    longPressTimerRef.current = window.setTimeout(async () => {
-      // if already scroll intent, don't arm
-      if (isScrollingRef.current) return;
-      longPressArmedRef.current = true;
-      await hapticLight();
-    }, LONG_PRESS_MS);
+    gestureRef.current = {
+      active: true,
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      startSlot,
+      mode: "pending",
+      pressEl: e.currentTarget as HTMLElement,
+    };
   }
 
   function onGridPointerMove(e: React.PointerEvent) {
-    if (e.buttons === 0) return;
-    lastMoveRef.current = { x: e.clientX, y: e.clientY };
+    const g = gestureRef.current;
+    if (!g || !g.active) return;
+    if (e.pointerId !== g.pointerId) return;
 
-    const s = startPtRef.current;
-    if (s) {
-      const dx = e.clientX - s.x;
-      const dy = e.clientY - s.y;
+    const dx = e.clientX - g.startX;
+    const dy = e.clientY - g.startY;
+    const adx = Math.abs(dx);
+    const ady = Math.abs(dy);
 
-      if (!isScrollingRef.current && shouldTreatAsScroll(dx, dy)) {
-        isScrollingRef.current = true;
-        cancelLongPressTimer();
-        longPressArmedRef.current = false;
+    if (g.mode === "pending") {
+      if (ady > SCROLL_CANCEL_PX && ady > adx * AXIS_LOCK_RATIO) {
+        g.mode = "scroll";
+        return;
+      }
+      if (adx > DRAG_START_PX && adx > ady * AXIS_LOCK_RATIO) {
+        g.mode = "hdrag";
+        try {
+          g.pressEl?.setPointerCapture?.(g.pointerId);
+        } catch {}
+      } else {
+        return;
       }
     }
 
-    // ✅ Drag-range only after long press armed AND not scrolling
-    if (!longPressArmedRef.current) return;
-    if (isScrollingRef.current) return;
-
-    const a = anchorRef.current ?? pressSlotRef.current?.start ?? null;
-    if (a == null) return;
+    if (g.mode !== "hdrag") return;
 
     const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
-    const cellEl = el?.closest("[data-slot]") as HTMLElement | null;
+    const cellEl = el?.closest?.("[data-slot]") as HTMLElement | null;
     if (!cellEl) return;
 
     const slot = Number(cellEl.dataset.slot);
     if (Number.isNaN(slot)) return;
 
-    draggedRef.current = true;
-    selectRange(a, slot);
+    selectRange(g.startSlot, slot);
   }
 
   function onPointerUp(e?: React.PointerEvent) {
-    cancelLongPressTimer();
-
-    const wasDrag = draggedRef.current;
-    const wasScroll = isScrollingRef.current;
-
-    // figure out pointerup slot (strict tap)
-    let upSlot: number | null = null;
-    if (e) {
-      const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
-      const cellEl = el?.closest("[data-slot]") as HTMLElement | null;
-      if (cellEl) {
-        const s = Number(cellEl.dataset.slot);
-        if (!Number.isNaN(s)) upSlot = s;
-      }
-    }
-
-    // reset
-    draggedRef.current = false;
-    pressSlotRef.current = null;
-    anchorRef.current = null;
-    longPressArmedRef.current = false;
-    isScrollingRef.current = false;
-    startPtRef.current = null;
-
-    const tap = tapRef.current;
-    tapRef.current = null;
-
-    // If user dragged range: keep selection and let sheet appear
-    if (wasDrag) return;
-
-    // If user scrolled: do nothing
-    if (!tap || wasScroll) return;
-
-    // Strict tap: must end on same slot
-    if (upSlot == null || downSlotRef.current == null || upSlot !== downSlotRef.current) return;
-
-    const dt = Date.now() - tap.t;
-    const endX = e?.clientX ?? lastMoveRef.current?.x ?? tap.x;
-    const endY = e?.clientY ?? lastMoveRef.current?.y ?? tap.y;
-    const dx = Math.abs(endX - tap.x);
-    const dy = Math.abs(endY - tap.y);
-
-    if (dt <= TAP_MAX_MS && dx <= TAP_MAX_MOVE && dy <= TAP_MAX_MOVE) {
-      // ✅ Tap selects SINGLE slot, always reselect
-      setShowPicker(false);
-      setSelected(new Set([tap.slot]));
-    }
+    const g = gestureRef.current;
+    if (!g) return;
+    gestureRef.current = null;
   }
 
   async function applyEvent(eventId: string | null) {
@@ -809,7 +970,6 @@ export default function App() {
     setEvents((prev) => [...prev, { id: uid("evt"), categoryId, name: trimmed, fixed: false }]);
   }
 
-
   function findSleepEventId() {
     const sleepEvt = events.find((e) => e.name?.trim() === "睡觉");
     return sleepEvt?.id ?? null;
@@ -852,134 +1012,17 @@ export default function App() {
     });
   }
 
-  // ===== Stats: day =====
-  const dayStats = useMemo(() => {
-    if (!day) return [];
-    const count = new Map<string, number>();
-    for (const eid of day.slots) {
-      if (!eid) continue;
-      count.set(eid, (count.get(eid) ?? 0) + 1);
-    }
-    return Array.from(count.entries())
-      .map(([eid, slots]) => {
-        const ev = eventById.get(eid);
-        const catName = ev ? catById.get(ev.categoryId)?.name : undefined;
-        const label = ev ? formatEventLabel(ev, catName) : "（已删除）";
-        return { eventId: eid, label, minutes: slots * SLOT_MINUTES, color: segmentAccentColor(label, isDark) };
-      })
-      .sort((a, b) => b.minutes - a.minutes);
-  }, [day, eventById, catById, isDark]);
-
-    // ✅ Day stats by Category (1st-level)
-  const dayCatStats = useMemo(() => {
-    if (!day) return [];
-    const count = new Map<string, number>(); // categoryId -> slots
-    for (const eid of day.slots) {
-      if (!eid) continue;
-      const ev = eventById.get(eid);
-      if (!ev) continue;
-      count.set(ev.categoryId, (count.get(ev.categoryId) ?? 0) + 1);
-    }
-
-    return Array.from(count.entries())
-      .map(([catId, slots]) => {
-        const catName = catById.get(catId)?.name ?? "未分类";
-        const minutes = slots * SLOT_MINUTES;
-        return { catId, label: catName, minutes, color: segmentAccentColor(catName, isDark) };
-      })
-      .sort((a, b) => b.minutes - a.minutes);
-  }, [day, eventById, catById, isDark]);
-
-  const filteredDayStats = useMemo(() => {
-    if (!statsCatFilter) return dayStats;
-    return dayStats.filter((x) => {
-      const ev = eventById.get(x.eventId);
-      return ev?.categoryId === statsCatFilter;
-    });
-  }, [dayStats, statsCatFilter, eventById]);
-
-
-  const donutItems = useMemo(() => {
-    const top = dayStats.slice(0, 6).map((x) => ({ label: x.label, value: x.minutes, color: x.color }));
-    const rest = dayStats.slice(6).reduce((s, x) => s + x.minutes, 0);
-    if (rest > 0) top.push({ label: "其他", value: rest, color: isDark ? "#6b7280" : "#9ca3af" });
-    return top;
-  }, [dayStats, isDark]);
-
-  // ===== Stats: week =====
-  const [weekStats, setWeekStats] = useState<{ label: string; minutes: number; color: string }[]>([]);
-  const [weekTotalMinutes, setWeekTotalMinutes] = useState(0);
-  const [weekBars, setWeekBars] = useState<{ dateKey: string; total: number; parts: { label: string; minutes: number; color: string }[] }[]>([]);
-
-  useEffect(() => {
-    if (tab !== "stats") return;
-    (async () => {
-      const startKey = getWeekStartKey(dateKey);
-      const keys = Array.from({ length: 7 }, (_, i) => addDays(startKey, i));
-      const days = await Promise.all(keys.map((k) => loadOrInitDay(k)));
-
-      // week aggregate
-      const count = new Map<string, number>();
-      for (const d of days) {
-        for (const eid of d.slots) {
-          if (!eid) continue;
-          count.set(eid, (count.get(eid) ?? 0) + 1);
-        }
-      }
-
-      const rows = Array.from(count.entries())
-        .map(([eid, slots]) => {
-          const ev = eventById.get(eid);
-          const catName = ev ? catById.get(ev.categoryId)?.name : undefined;
-          const label = ev ? formatEventLabel(ev, catName) : "（已删除）";
-          const minutes = slots * SLOT_MINUTES;
-          return { label, minutes, color: segmentAccentColor(label, isDark) };
-        })
-        .sort((a, b) => b.minutes - a.minutes);
-
-      setWeekStats(rows);
-      setWeekTotalMinutes(rows.reduce((s, x) => s + x.minutes, 0));
-
-      // per-day stacked bars (top 4 + other)
-      const perDay = days.map((d, idx) => {
-        const c = new Map<string, number>();
-        for (const eid of d.slots) {
-          if (!eid) continue;
-          c.set(eid, (c.get(eid) ?? 0) + 1);
-        }
-        const items = Array.from(c.entries())
-          .map(([eid, slots]) => {
-            const ev = eventById.get(eid);
-            const catName = ev ? catById.get(ev.categoryId)?.name : undefined;
-            const label = ev ? formatEventLabel(ev, catName) : "（已删除）";
-            const minutes = slots * SLOT_MINUTES;
-            return { label, minutes, color: segmentAccentColor(label, isDark) };
-          })
-          .sort((a, b) => b.minutes - a.minutes);
-
-        const top = items.slice(0, 4);
-        const rest = items.slice(4).reduce((s, x) => s + x.minutes, 0);
-        if (rest > 0) top.push({ label: "其他", minutes: rest, color: isDark ? "rgba(255,255,255,0.22)" : "rgba(17,24,39,0.12)" });
-
-        const total = items.reduce((s, x) => s + x.minutes, 0);
-        return { dateKey: keys[idx], total, parts: top };
-      });
-
-      setWeekBars(perDay);
-    })();
-  }, [tab, dateKey, eventById, catById, isDark]);
-
   // ===== selection info =====
   const selectionInfo = useMemo(() => {
     if (selected.size === 0) return null;
     const arr = Array.from(selected).sort((a, b) => a - b);
     const start = arr[0];
-    const end = arr[arr.length - 1] + 1; // exclusive
+    const end = arr[arr.length - 1] + 1;
     const minutes = arr.length * SLOT_MINUTES;
     return { start, end, minutes, startTime: slotToTime(start), endTime: slotToTime(end) };
   }, [selected]);
 
-  // ===== global segments (must be BEFORE conditional return) =====
+  // ===== global segments =====
   const globalSegments = useMemo(() => {
     if (!day) return [];
     const segs: { start: number; end: number; len: number; eventId: string }[] = [];
@@ -998,33 +1041,197 @@ export default function App() {
     return segs;
   }, [day]);
 
-  if (!settings || !day) {
-    return <div style={{ padding: 16, fontFamily: "system-ui" }}>Loading…</div>;
-  }
-
-  // ===== helpers for segments =====
-  function getEventLabelAndSeed(eventId: string) {
+  // ===== label + color helpers =====
+  function getEventLabelAndColor(eventId: string) {
     const ev = eventById.get(eventId);
-    if (!ev) return { label: "（已删除）", seed: "deleted" };
+    if (!ev) return { label: "（已删除）", fill: isDark ? "rgba(255,255,255,0.10)" : "rgba(17,24,39,0.08)", accent: isDark ? "rgba(255,255,255,0.45)" : "rgba(17,24,39,0.45)" };
 
-    // ✅ 记录页只显示二级
-    const label = (ev.name ?? "").trim() || "未命名";
-
-    // ✅ 颜色 seed 用 一级/二级（更稳定）
-    const catName = catById.get(ev.categoryId)?.name ?? "未分类";
-    const seed = `${catName}/${label}`;
-
-    return { label, seed };
+    const label = (ev.name ?? "").trim() || (catById.get(ev.categoryId)?.name ?? "未命名");
+    const { fill, accent } = eventColorFamily(ev.categoryId, ev.id, isDark);
+    return { label, fill, accent };
   }
 
+  /** ===== Stats (Overview / Day / Week / Month) ===== */
+  // day aggregates
+  const dayAgg = useMemo(() => aggregateDays([day!], eventById), [day, eventById]);
+
+  const dayCatStats = useMemo(() => {
+    const rows = topNFromMap(dayAgg.byCat, 999).map((r) => {
+      const catName = catById.get(r.id)?.name ?? "未分类";
+      return { catId: r.id, label: catName, minutes: r.minutes, color: categoryAccent(r.id, isDark) };
+    });
+    return rows;
+  }, [dayAgg, catById, isDark]);
+
+  const dayEventStats = useMemo(() => {
+    const rows = topNFromMap(dayAgg.byEvent, 999).map((r) => {
+      const ev = eventById.get(r.id);
+      const catName = ev ? catById.get(ev.categoryId)?.name : undefined;
+      const label = ev ? formatEventLabel(ev, catName) : "（已删除）";
+      const color = ev ? eventColorFamily(ev.categoryId, ev.id, isDark).accent : (isDark ? "rgba(255,255,255,0.40)" : "rgba(17,24,39,0.40)");
+      return { eventId: r.id, label, minutes: r.minutes, color };
+    });
+    return rows;
+  }, [dayAgg, eventById, catById, isDark]);
+
+  const filteredDayEventStats = useMemo(() => {
+    if (!statsCatFilter) return dayEventStats;
+    return dayEventStats.filter((x) => {
+      const ev = eventById.get(x.eventId);
+      return ev?.categoryId === statsCatFilter;
+    });
+  }, [dayEventStats, statsCatFilter, eventById]);
+
+  const donutItems = useMemo(() => {
+    const top = dayEventStats.slice(0, 6).map((x) => ({ label: x.label, value: x.minutes, color: x.color }));
+    const rest = dayEventStats.slice(6).reduce((s, x) => s + x.minutes, 0);
+    if (rest > 0) top.push({ label: "其他", value: rest, color: isDark ? "rgba(255,255,255,0.22)" : "rgba(17,24,39,0.14)" });
+    return top;
+  }, [dayEventStats, isDark]);
+
+  // week + month + overview state
+  const [weekBars, setWeekBars] = useState<{ dateKey: string; total: number; parts: { label: string; minutes: number; color: string }[] }[]>([]);
+  const [weekAgg, setWeekAgg] = useState<Agg>({ totalMinutes: 0, byCat: new Map(), byEvent: new Map() });
+
+  const [monthDays, setMonthDays] = useState<DayLog[]>([]);
+  const [monthAgg, setMonthAgg] = useState<Agg>({ totalMinutes: 0, byCat: new Map(), byEvent: new Map() });
+
+  const [overview, setOverview] = useState<{
+    today: Agg;
+    week: Agg;
+    month: Agg;
+    recent7: { dateKey: string; total: number }[];
+  } | null>(null);
+
+  useEffect(() => {
+    if (tab !== "stats") return;
+
+    (async () => {
+      // week
+      const startKey = getWeekStartKey(dateKey);
+      const weekKeys = Array.from({ length: 7 }, (_, i) => addDays(startKey, i));
+      const weekDays = await Promise.all(weekKeys.map((k) => loadOrInitDay(k)));
+      const wAgg = aggregateDays(weekDays, eventById);
+      setWeekAgg(wAgg);
+
+      // week bars (top 4 per day)
+      const perDay = weekDays.map((d, idx) => {
+        const agg = aggregateDays([d], eventById);
+        const items = topNFromMap(agg.byEvent, 999)
+          .map((x) => {
+            const ev = eventById.get(x.id);
+            const catName = ev ? catById.get(ev.categoryId)?.name : undefined;
+            const label = ev ? formatEventLabel(ev, catName) : "（已删除）";
+            const color = ev ? eventColorFamily(ev.categoryId, ev.id, isDark).accent : (isDark ? "rgba(255,255,255,0.22)" : "rgba(17,24,39,0.12)");
+            return { label, minutes: x.minutes, color };
+          })
+          .sort((a, b) => b.minutes - a.minutes);
+
+        const top = items.slice(0, 4);
+        const rest = items.slice(4).reduce((s, x) => s + x.minutes, 0);
+        if (rest > 0) top.push({ label: "其他", minutes: rest, color: isDark ? "rgba(255,255,255,0.22)" : "rgba(17,24,39,0.12)" });
+
+        return { dateKey: weekKeys[idx], total: agg.totalMinutes, parts: top };
+      });
+      setWeekBars(perDay);
+
+      // month
+      const mKeys = getMonthKeys(dateKey);
+      const mDays = await Promise.all(mKeys.map((k) => loadOrInitDay(k)));
+      setMonthDays(mDays);
+      setMonthAgg(aggregateDays(mDays, eventById));
+
+      // overview: today/week/month + recent7 totals
+      const todayAgg = aggregateDays([await loadOrInitDay(dateKey)], eventById);
+      const recent7Keys = Array.from({ length: 7 }, (_, i) => addDays(dateKey, -6 + i));
+      const recent7Days = await Promise.all(recent7Keys.map((k) => loadOrInitDay(k)));
+      const recent7 = recent7Days.map((d) => ({ dateKey: d.dateKey, total: aggregateDays([d], eventById).totalMinutes }));
+      setOverview({ today: todayAgg, week: wAgg, month: aggregateDays(mDays, eventById), recent7 });
+    })();
+  }, [tab, dateKey, eventById, catById, isDark]);
+
+  function fmtHM(mins: number) {
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    return `${h}h ${m}m`;
+  }
+
+  function renderTopCat(agg: Agg) {
+    const top = topNFromMap(agg.byCat, 1)[0];
+    if (!top) return { label: "—", sub: "" };
+    const name = catById.get(top.id)?.name ?? "未分类";
+    const pct = agg.totalMinutes > 0 ? Math.round((top.minutes / agg.totalMinutes) * 100) : 0;
+    return { label: name, sub: `${pct}%` };
+  }
+  function renderTopEvent(agg: Agg) {
+    const top = topNFromMap(agg.byEvent, 1)[0];
+    if (!top) return { label: "—", sub: "" };
+    const ev = eventById.get(top.id);
+    const catName = ev ? catById.get(ev.categoryId)?.name : undefined;
+    const label = ev ? formatEventLabel(ev, catName) : "（已删除）";
+    const pct = agg.totalMinutes > 0 ? Math.round((top.minutes / agg.totalMinutes) * 100) : 0;
+    return { label, sub: `${pct}%` };
+  }
+
+  // ===== Month heatmap layout =====
+  const monthGrid = useMemo(() => {
+    const startKey = getMonthStartKey(dateKey);
+    const startDate = dayKeyToDate(startKey);
+    // Monday-based weekday index: Mon=0..Sun=6
+    const jsDay = startDate.getDay(); // Sun=0..Sat=6
+    const monIdx = (jsDay + 6) % 7;
+
+    const n = getDaysInMonth(dateKey);
+    const cells: { dateKey: string | null; dayNum: number | null }[] = [];
+
+    for (let i = 0; i < monIdx; i++) cells.push({ dateKey: null, dayNum: null });
+    for (let d = 1; d <= n; d++) {
+      const k = addDays(startKey, d - 1);
+      cells.push({ dateKey: k, dayNum: d });
+    }
+    // pad to full weeks
+    while (cells.length % 7 !== 0) cells.push({ dateKey: null, dayNum: null });
+
+    const rows = [];
+    for (let i = 0; i < cells.length; i += 7) rows.push(cells.slice(i, i + 7));
+    return rows;
+  }, [dateKey]);
+
+  const monthTotalsByDay = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const d of monthDays) m.set(d.dateKey, aggregateDays([d], eventById).totalMinutes);
+    return m;
+  }, [monthDays, eventById]);
+
+  const monthMax = useMemo(() => {
+    let mx = 0;
+    for (const v of monthTotalsByDay.values()) mx = Math.max(mx, v);
+    return mx;
+  }, [monthTotalsByDay]);
+
+  // ===== Record page helper =====
+  function getSegStyle(eventId: string) {
+    const ev = eventById.get(eventId);
+    if (!ev) return { fill: isDark ? "rgba(255,255,255,0.10)" : "rgba(17,24,39,0.08)", accent: isDark ? "rgba(255,255,255,0.45)" : "rgba(17,24,39,0.45)" };
+    return eventColorFamily(ev.categoryId, ev.id, isDark);
+  }
+
+  const ready = !!settings && !!day;
+  const showBoot = !ready || booting;
 
   return (
     <div className="app-shell" style={styles.app} onPointerUp={onPointerUp} onPointerMove={onGridPointerMove}>
-      {/* Theme switch remount header (Android WebView artifact mitigation) */}
+          {showBoot ? (
+      <BootScreen isDark={ready ? isDark : false} />
+    ) : (
+      <>
       <Header
         key={isDark ? "dark" : "light"}
         current={tab}
-        onChange={setTab}
+        onChange={(t) => {
+          setTab(t);
+          if (t === "stats") setStatsMode("overview");
+        }}
         dateKey={dateKey}
         onPrevDay={() => setDateKey((k) => addDays(k, -1))}
         onNextDay={() => setDateKey((k) => addDays(k, 1))}
@@ -1054,37 +1261,37 @@ export default function App() {
             </button>
           </div>
 
-          {recentEvents.map((eid) => {
-          const ev = eventById.get(eid);
-          if (!ev) return null;
+          {/* ✅ Quick chips (fix: no-clear) */}
+          <div data-noclear="true" style={styles.chipsScroll}>
+            {recentEvents.map((eid) => {
+              const ev = eventById.get(eid);
+              if (!ev) return null;
 
-          const catName = catById.get(ev.categoryId)?.name ?? "未分类";
+              const catName = catById.get(ev.categoryId)?.name ?? "未分类";
+              const shortLabel = ev.name && ev.name.trim() ? ev.name.trim() : catName;
 
-          // ✅ 显示：优先二级；没有二级就显示一级
-          const shortLabel = ev.name && ev.name.trim() ? ev.name.trim() : catName;
+              const { accent } = eventColorFamily(ev.categoryId, ev.id, isDark);
 
-          // ✅ 颜色：用完整标签做 seed
-          const fullLabel = ev.name && ev.name.trim() ? `${catName}/${ev.name.trim()}` : catName;
-          const seed = fullLabel || eid;
-
-          return (
-            <button
-              key={eid}
-              style={{
-                ...styles.chip,
-                background: theme.chipBg,
-                border: `1px solid ${theme.chipBorder}`,
-                opacity: selected.size === 0 ? 0.7 : 1,
-              }}
-              disabled={selected.size === 0}
-              onClick={() => applyEvent(eid)}
-              title="应用到选中格子"
-            >
-              <span style={{ ...styles.dot, background: segmentAccentColor(seed, isDark) }} />
-              {shortLabel}
-            </button>
-          );
-        })}
+              return (
+                <button
+                  key={eid}
+                  data-noclear="true"
+                  style={{
+                    ...styles.chip,
+                    background: theme.chipBg,
+                    border: `1px solid ${accent}`,
+                    opacity: selected.size === 0 ? 0.7 : 1,
+                  }}
+                  disabled={selected.size === 0}
+                  onClick={() => applyEvent(eid)}
+                  title="应用到选中格子"
+                >
+                  <span style={{ ...styles.dot, background: accent }} />
+                  {shortLabel}
+                </button>
+              );
+            })}
+          </div>
 
           {/* Grid */}
           <div style={styles.gridWrap}>
@@ -1109,13 +1316,11 @@ export default function App() {
                   const startCol = start - rowStart;
                   const len = end - start;
 
-                  const isStartHere = start === g.start; // true start of global segment
-                  const isEndHere = end === g.end; // true end of global segment
+                  const isStartHere = start === g.start;
+                  const isEndHere = end === g.end;
 
                   return {
                     eventId: g.eventId,
-                    globalStart: g.start,
-                    globalEnd: g.end,
                     totalLen: g.len,
                     startCol,
                     len,
@@ -1125,8 +1330,6 @@ export default function App() {
                 })
                 .filter(Boolean) as {
                 eventId: string;
-                globalStart: number;
-                globalEnd: number;
                 totalLen: number;
                 startCol: number;
                 len: number;
@@ -1160,7 +1363,6 @@ export default function App() {
                     })}
 
                     <div style={styles.rowOverlay}>
-                      {/* now indicator */}
                       {showNowInThisRow && (
                         <>
                           <div style={{ ...styles.nowLine, left: `calc(${nowLeftPct}% + 6px)` }} />
@@ -1168,23 +1370,18 @@ export default function App() {
                         </>
                       )}
 
-                      {/* Segment blocks */}
                       {rowSegments.map((seg, idx) => {
-                        const { label, seed } = getEventLabelAndSeed(seg.eventId);
+                        const { label, fill, accent } = getEventLabelAndColor(seg.eventId);
                         const minutes = seg.totalLen * SLOT_MINUTES;
 
                         const leftPct = (seg.startCol / 8) * 100;
                         const widthPct = (seg.len / 8) * 100;
 
-                        const fill = segmentFillColor(seed, isDark);
-                        const accent = segmentAccentColor(seed, isDark);
-
-                        // ✅ Multi-row bar: only true start and true end are rounded; middle connections are flat.
                         const R = 14;
                         const roundLeft = seg.isStartHere ? R : 0;
                         const roundRight = seg.isEndHere ? R : 0;
 
-                        const showTextHere = seg.isStartHere; // only first row show text
+                        const showTextHere = seg.isStartHere;
 
                         return (
                           <div
@@ -1220,7 +1417,6 @@ export default function App() {
 
           <div style={{ height: 110 }} />
 
-          {/* Bottom sheet */}
           {selectionInfo && (
             <div style={styles.sheetWrap} data-noclear="true">
               <div style={styles.sheetHandle} />
@@ -1239,6 +1435,7 @@ export default function App() {
                   onClick={(e) => {
                     e.stopPropagation();
                     setShowPicker(true);
+                    hapticLight();
                   }}
                 >
                   标注
@@ -1276,7 +1473,6 @@ export default function App() {
               onPick={async (eventId) => {
                 await applyEvent(eventId);
                 setShowPicker(false);
-          
               }}
               isDark={isDark}
             />
@@ -1286,128 +1482,411 @@ export default function App() {
 
       {tab === "stats" && (
         <div style={styles.page}>
-          <h2 style={styles.h2}>统计</h2>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+            <h2 style={styles.h2}>统计</h2>
+            <div style={styles.subtle}>{dateKey}</div>
+          </div>
 
-          <div style={styles.card}>
-            <div style={styles.cardTitle}>本日（{dateKey}）</div>
+          {/* Stats mode tabs */}
+          <div
+            data-noclear="true"
+            style={{
+              display: "flex",
+              gap: 6,
+              padding: 6,
+              borderRadius: 999,
+              border: `1px solid ${theme.hairline}`,
+              background: isDark ? "rgba(255,255,255,0.06)" : "rgba(17,24,39,0.05)",
+              marginBottom: 12,
+              width: "fit-content",
+            }}
+          >
+            <Pill active={statsMode === "overview"} onClick={() => setStatsMode("overview")} theme={theme}>
+              Overview
+            </Pill>
+            <Pill active={statsMode === "day"} onClick={() => setStatsMode("day")} theme={theme}>
+              日
+            </Pill>
+            <Pill active={statsMode === "week"} onClick={() => setStatsMode("week")} theme={theme}>
+              周
+            </Pill>
+            <Pill active={statsMode === "month"} onClick={() => setStatsMode("month")} theme={theme}>
+              月
+            </Pill>
+          </div>
 
-            <div style={styles.statsGrid}>
-              <div>
-                <DonutChart items={donutItems} size={220} isDark={isDark} />
+          {/* Overview */}
+          {statsMode === "overview" && overview && (
+            <>
+              <div style={styles.card}>
+                <div style={styles.cardTitle}>总览</div>
+                <div style={styles.subtle}>快速看懂：今天 / 本周 / 本月</div>
 
-                {/* ✅ Day list: keep only ONE set */}
-                <div style={{ marginTop: 10, display: "grid", gap: 6 }}>
-                  {donutItems.map((it) => (
-                    <div key={it.label} style={{ display: "grid", gridTemplateColumns: "14px 1fr 70px", gap: 8, alignItems: "center" }}>
-                      <div style={{ width: 12, height: 12, borderRadius: 4, background: it.color }} />
-                      <div style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: theme.text }}>
-                        {it.label}
+                <div style={{ height: 10 }} />
+
+                <div style={{ display: "grid", gap: 10 }}>
+                  {[
+                    { title: "Today", agg: overview.today },
+                    { title: "This Week", agg: overview.week },
+                    { title: "This Month", agg: overview.month },
+                  ].map((x) => {
+                    const topCat = renderTopCat(x.agg);
+                    const topEv = renderTopEvent(x.agg);
+                    return (
+                      <div
+                        key={x.title}
+                        style={{
+                          border: `1px solid ${theme.hairline}`,
+                          borderRadius: 18,
+                          padding: 12,
+                          background: isDark ? "rgba(255,255,255,0.03)" : "rgba(17,24,39,0.03)",
+                        }}
+                      >
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+                          <div style={{ fontWeight: 1000, letterSpacing: -0.2 }}>{x.title}</div>
+                          <div style={{ fontWeight: 1000 }}>{fmtHM(x.agg.totalMinutes)}</div>
+                        </div>
+
+                        <div style={{ height: 8 }} />
+
+                        <div style={{ display: "grid", gap: 6 }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                            <div style={styles.subtle}>Top Category</div>
+                            <div style={{ fontWeight: 950 }}>
+                              {topCat.label} <span style={{ opacity: 0.7 }}>{topCat.sub}</span>
+                            </div>
+                          </div>
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                            <div style={styles.subtle}>Top Event</div>
+                            <div style={{ fontWeight: 950, maxWidth: "70%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {topEv.label} <span style={{ opacity: 0.7 }}>{topEv.sub}</span>
+                            </div>
+                          </div>
+                        </div>
                       </div>
-                      <div style={{ fontSize: 13, textAlign: "right", color: theme.text, fontWeight: 950 }}>
-                        {Math.floor(it.value / 60)}h {it.value % 60}m
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
+                </div>
 
-                              <div style={{ height: 14 }} />
+                <div style={{ height: 14 }} />
 
-            {/* ✅ 一级（宏观） */}
-            <div style={{ fontWeight: 950, marginBottom: 8, color: theme.text }}>一级分配（宏观）</div>
-            {dayCatStats.length === 0 ? (
-              <div style={styles.subtle}>今日还没有记录。</div>
-            ) : (
-              <div style={{ display: "grid", gap: 8 }}>
-                {dayCatStats.map((r) => {
-                  const active = statsCatFilter === r.catId;
-                  return (
-                    <button
-                      key={r.catId}
-                      onClick={() => setStatsCatFilter(active ? null : r.catId)}
-                      style={{
-                        ...styles.btnGhost,
-                        display: "grid",
-                        gridTemplateColumns: "14px 1fr 90px",
-                        gap: 10,
-                        alignItems: "center",
-                        textAlign: "left",
-                        background: active ? (isDark ? "rgba(255,255,255,0.06)" : "rgba(17,24,39,0.05)") : theme.panel,
-                      }}
-                    >
-                      <div style={{ width: 12, height: 12, borderRadius: 4, background: r.color }} />
-                      <div style={{ fontWeight: 950, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {r.label}
-                        {active ? "（筛选中）" : ""}
+                <div style={{ fontWeight: 950, marginBottom: 8 }}>最近 7 天</div>
+                <div style={{ display: "grid", gap: 8 }}>
+                  {overview.recent7.map((d) => {
+                    const pct = Math.min(1, monthMax > 0 ? d.total / Math.max(monthMax, 1) : 0);
+                    const barBg = isDark ? "rgba(255,255,255,0.10)" : "rgba(17,24,39,0.08)";
+                    const fill = isDark ? "rgba(255,255,255,0.24)" : "rgba(17,24,39,0.22)";
+                    return (
+                      <div key={d.dateKey} style={{ display: "grid", gridTemplateColumns: "86px 1fr 70px", gap: 10, alignItems: "center" }}>
+                        <button
+                          style={{ ...styles.btnGhost, padding: "8px 10px" }}
+                          onClick={() => {
+                            setDateKey(d.dateKey);
+                            setStatsMode("day");
+                          }}
+                        >
+                          {d.dateKey.slice(5)}
+                        </button>
+                        <div style={{ height: 10, borderRadius: 999, background: barBg, overflow: "hidden" }}>
+                          <div style={{ height: "100%", width: `${pct * 100}%`, background: fill }} />
+                        </div>
+                        <div style={{ textAlign: "right", fontWeight: 950, opacity: 0.8 }}>{Math.round((d.total / 60) * 10) / 10}h</div>
                       </div>
-                      <div style={{ textAlign: "right", fontWeight: 950 }}>
-                        {Math.floor(r.minutes / 60)}h {r.minutes % 60}m
-                      </div>
-                    </button>
-                  );
-                })}
+                    );
+                  })}
+                </div>
               </div>
-            )}
+            </>
+          )}
 
-            <div style={{ height: 14 }} />
+          {/* Day */}
+          {statsMode === "day" && (
+            <div style={styles.card}>
+              <div style={styles.cardTitle}>本日（{dateKey}）</div>
 
-            {/* ✅ 二级（微观） */}
-            <div style={{ fontWeight: 950, marginBottom: 8, color: theme.text }}>
-              二级明细（微观）{statsCatFilter ? " · 已按一级筛选" : ""}
-            </div>
-            <div style={{ display: "grid", gap: 6 }}>
-              {filteredDayStats.length === 0 ? (
-                <div style={styles.subtle}>没有明细。</div>
-              ) : (
-                filteredDayStats.slice(0, 12).map((it) => (
-                  <div
-                    key={it.eventId}
-                    style={{ display: "grid", gridTemplateColumns: "14px 1fr 90px", gap: 8, alignItems: "center" }}
-                  >
-                    <div style={{ width: 12, height: 12, borderRadius: 4, background: it.color }} />
-                    <div style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: theme.text }}>
-                      {it.label}
+              <div style={styles.statsGrid}>
+                <div>
+                  <DonutChart items={donutItems} size={220} isDark={isDark} />
+
+                  <div style={{ marginTop: 10, display: "grid", gap: 6 }}>
+                    {donutItems.map((it) => (
+                      <div key={it.label} style={{ display: "grid", gridTemplateColumns: "14px 1fr 70px", gap: 8, alignItems: "center" }}>
+                        <div style={{ width: 12, height: 12, borderRadius: 4, background: it.color }} />
+                        <div style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: theme.text }}>
+                          {it.label}
+                        </div>
+                        <div style={{ fontSize: 13, textAlign: "right", color: theme.text, fontWeight: 950 }}>
+                          {Math.floor(it.value / 60)}h {it.value % 60}m
+                        </div>
+                      </div>
+                    ))}
+
+                    <div style={{ height: 14 }} />
+
+                    <div style={{ fontWeight: 950, marginBottom: 8, color: theme.text }}>一级分配（宏观）</div>
+                    {dayCatStats.length === 0 ? (
+                      <div style={styles.subtle}>今日还没有记录。</div>
+                    ) : (
+                      <div style={{ display: "grid", gap: 8 }}>
+                        {dayCatStats.map((r) => {
+                          const active = statsCatFilter === r.catId;
+                          return (
+                            <button
+                              key={r.catId}
+                              onClick={() => setStatsCatFilter(active ? null : r.catId)}
+                              style={{
+                                ...styles.btnGhost,
+                                display: "grid",
+                                gridTemplateColumns: "14px 1fr 90px",
+                                gap: 10,
+                                alignItems: "center",
+                                textAlign: "left",
+                                background: active
+                                  ? isDark
+                                    ? "rgba(255,255,255,0.06)"
+                                    : "rgba(17,24,39,0.05)"
+                                  : theme.panel,
+                              }}
+                            >
+                              <div style={{ width: 12, height: 12, borderRadius: 4, background: r.color }} />
+                              <div style={{ fontWeight: 950, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                {r.label}
+                                {active ? "（筛选中）" : ""}
+                              </div>
+                              <div style={{ textAlign: "right", fontWeight: 950 }}>
+                                {Math.floor(r.minutes / 60)}h {r.minutes % 60}m
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    <div style={{ height: 14 }} />
+
+                    <div style={{ fontWeight: 950, marginBottom: 8, color: theme.text }}>
+                      二级明细（微观）{statsCatFilter ? " · 已按一级筛选" : ""}
                     </div>
-                    <div style={{ fontSize: 13, textAlign: "right", color: theme.text, fontWeight: 900 }}>
-                      {Math.floor(it.minutes / 60)}h {it.minutes % 60}m
+                    <div style={{ display: "grid", gap: 6 }}>
+                      {filteredDayEventStats.length === 0 ? (
+                        <div style={styles.subtle}>没有明细。</div>
+                      ) : (
+                        filteredDayEventStats.slice(0, 12).map((it) => (
+                          <div
+                            key={it.eventId}
+                            style={{ display: "grid", gridTemplateColumns: "14px 1fr 90px", gap: 8, alignItems: "center" }}
+                          >
+                            <div style={{ width: 12, height: 12, borderRadius: 4, background: it.color }} />
+                            <div style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: theme.text }}>
+                              {it.label}
+                            </div>
+                            <div style={{ fontSize: 13, textAlign: "right", color: theme.text, fontWeight: 900 }}>
+                              {Math.floor(it.minutes / 60)}h {it.minutes % 60}m
+                            </div>
+                          </div>
+                        ))
+                      )}
                     </div>
                   </div>
-                ))
-              )}
-            </div>
-
                 </div>
               </div>
             </div>
-          </div>
+          )}
 
-          <div style={{ height: 12 }} />
+          {/* Week */}
+          {statsMode === "week" && (
+            <div style={styles.card}>
+              <div style={styles.cardTitle}>本周（周一～周日）</div>
+              <div style={styles.subtle}>总计：{Math.round((weekAgg.totalMinutes / 60) * 10) / 10}h</div>
 
-          <div style={styles.card}>
-            <div style={styles.cardTitle}>本周（周一～周日）</div>
-            <div style={styles.subtle}>总计：{Math.round((weekTotalMinutes / 60) * 10) / 10}h</div>
+              <div style={{ marginTop: 12 }}>
+                <WeekStackBar days={weekBars} isDark={isDark} />
+              </div>
 
-            <div style={{ marginTop: 12 }}>
-              <WeekStackBar days={weekBars} isDark={isDark} />
-            </div>
+              <div style={{ height: 12 }} />
 
-            <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
-              {weekStats.length === 0 ? (
-                <div style={styles.subtle}>本周还没有记录。</div>
-              ) : (
-                weekStats.slice(0, 10).map((r) => (
-                  <div key={r.label} style={styles.statRow}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, overflow: "hidden" }}>
-                      <span style={{ width: 10, height: 10, borderRadius: 4, background: r.color, flex: "0 0 auto" }} />
-                      <div style={styles.statLabel}>{r.label}</div>
+              <div style={{ fontWeight: 950, marginBottom: 8 }}>一级分配</div>
+              <div style={{ display: "grid", gap: 8 }}>
+                {topNFromMap(weekAgg.byCat, 8).map((r) => {
+                  const catName = catById.get(r.id)?.name ?? "未分类";
+                  return (
+                    <div key={r.id} style={styles.statRow}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, overflow: "hidden" }}>
+                        <span style={{ width: 10, height: 10, borderRadius: 4, background: categoryAccent(r.id, isDark), flex: "0 0 auto" }} />
+                        <div style={styles.statLabel}>{catName}</div>
+                      </div>
+                      <div style={styles.statValue}>{fmtHM(r.minutes)}</div>
                     </div>
-                    <div style={styles.statValue}>
-                      {Math.floor(r.minutes / 60)}h {r.minutes % 60}m
+                  );
+                })}
+              </div>
+
+              <div style={{ height: 12 }} />
+
+              <div style={{ fontWeight: 950, marginBottom: 8 }}>二级 Top 10</div>
+              <div style={{ display: "grid", gap: 8 }}>
+                {topNFromMap(weekAgg.byEvent, 10).map((r) => {
+                  const ev = eventById.get(r.id);
+                  const catName = ev ? catById.get(ev.categoryId)?.name : undefined;
+                  const label = ev ? formatEventLabel(ev, catName) : "（已删除）";
+                  const color = ev ? eventColorFamily(ev.categoryId, ev.id, isDark).accent : (isDark ? "rgba(255,255,255,0.22)" : "rgba(17,24,39,0.12)");
+                  return (
+                    <div key={r.id} style={styles.statRow}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, overflow: "hidden" }}>
+                        <span style={{ width: 10, height: 10, borderRadius: 4, background: color, flex: "0 0 auto" }} />
+                        <div style={styles.statLabel}>{label}</div>
+                      </div>
+                      <div style={styles.statValue}>{fmtHM(r.minutes)}</div>
                     </div>
-                  </div>
-                ))
-              )}
+                  );
+                })}
+              </div>
             </div>
-          </div>
+          )}
+
+          {/* Month */}
+          {statsMode === "month" && (
+            <div style={styles.card}>
+              <div style={styles.cardTitle}>本月</div>
+              <div style={styles.subtle}>
+                总计：{Math.round((monthAgg.totalMinutes / 60) * 10) / 10}h · 点击某天跳转到日统计
+              </div>
+
+              <div style={{ height: 10 }} />
+
+              {/* Month heatmap */}
+              <div
+                style={{
+                  border: `1px solid ${theme.hairline}`,
+                  borderRadius: 18,
+                  overflow: "hidden",
+                  background: isDark ? "rgba(255,255,255,0.03)" : "rgba(17,24,39,0.03)",
+                }}
+              >
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(7, 1fr)",
+                    gap: 0,
+                    borderBottom: `1px solid ${theme.hairline}`,
+                    background: theme.panel,
+                  }}
+                >
+                  {["一", "二", "三", "四", "五", "六", "日"].map((w) => (
+                    <div key={w} style={{ padding: "8px 10px", fontSize: 12, fontWeight: 950, color: theme.sub, textAlign: "center" }}>
+                      {w}
+                    </div>
+                  ))}
+                </div>
+
+                <div style={{ display: "grid", gap: 0 }}>
+                  {monthGrid.map((row, ridx) => (
+                    <div key={ridx} style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)" }}>
+                      {row.map((cell, cidx) => {
+                        if (!cell.dateKey) {
+                          return (
+                            <div
+                              key={cidx}
+                              style={{
+                                minHeight: 44,
+                                borderRight: cidx === 6 ? "none" : `1px solid ${theme.hairline}`,
+                                borderBottom: `1px solid ${theme.hairline}`,
+                                background: theme.panel,
+                              }}
+                            />
+                          );
+                        }
+
+                        const total = monthTotalsByDay.get(cell.dateKey) ?? 0;
+                        const t = monthMax > 0 ? total / monthMax : 0;
+                        const alpha = total === 0 ? 0 : Math.min(0.85, 0.12 + t * 0.73);
+
+                        const isToday = cell.dateKey === toDateKey();
+
+                        return (
+                          <button
+                            key={cidx}
+                            onClick={() => {
+                              setDateKey(cell.dateKey!);
+                              setStatsMode("day");
+                            }}
+                            style={{
+                              minHeight: 44,
+                              borderRight: cidx === 6 ? "none" : `1px solid ${theme.hairline}`,
+                              borderBottom: `1px solid ${theme.hairline}`,
+                              background: theme.panel,
+                              cursor: "pointer",
+                              padding: 10,
+                              textAlign: "left",
+                              position: "relative",
+                            }}
+                            title={`${cell.dateKey} · ${Math.round((total / 60) * 10) / 10}h`}
+                          >
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                              <div style={{ fontWeight: 1000, color: theme.text }}>{cell.dayNum}</div>
+                              <div style={{ fontSize: 11, color: theme.sub, fontWeight: 900 }}>
+                                {total > 0 ? `${Math.round((total / 60) * 10) / 10}h` : ""}
+                              </div>
+                            </div>
+
+                            <div
+                              style={{
+                                marginTop: 6,
+                                height: 8,
+                                borderRadius: 999,
+                                background: isDark ? "rgba(255,255,255,0.08)" : "rgba(17,24,39,0.07)",
+                                overflow: "hidden",
+                              }}
+                            >
+                              <div
+                                style={{
+                                  height: "100%",
+                                  width: `${Math.min(100, (t * 100) || 0)}%`,
+                                  background: isDark ? `rgba(255,255,255,${alpha})` : `rgba(17,24,39,${alpha})`,
+                                }}
+                              />
+                            </div>
+
+                            {isToday && (
+                              <div
+                                style={{
+                                  position: "absolute",
+                                  inset: 6,
+                                  borderRadius: 14,
+                                  border: `1px solid ${isDark ? "rgba(255,255,255,0.22)" : "rgba(17,24,39,0.16)"}`,
+                                  pointerEvents: "none",
+                                }}
+                              />
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ height: 14 }} />
+
+              <div style={{ fontWeight: 950, marginBottom: 8 }}>一级分配 Top 8</div>
+              <div style={{ display: "grid", gap: 8 }}>
+                {topNFromMap(monthAgg.byCat, 8).map((r) => {
+                  const catName = catById.get(r.id)?.name ?? "未分类";
+                  return (
+                    <div key={r.id} style={styles.statRow}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, overflow: "hidden" }}>
+                        <span style={{ width: 10, height: 10, borderRadius: 4, background: categoryAccent(r.id, isDark), flex: "0 0 auto" }} />
+                        <div style={styles.statLabel}>{catName}</div>
+                      </div>
+                      <div style={styles.statValue}>{fmtHM(r.minutes)}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
         </div>
+       
       )}
 
       {tab === "more" && (
@@ -1419,7 +1898,7 @@ export default function App() {
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 10, alignItems: "center" }}>
               <div style={styles.subtle}>主题</div>
               <select
-                value={settings.themeMode}
+                value={settings?.themeMode ?? "system"}
                 onChange={(e) => setSettings((s) => (s ? { ...s, themeMode: e.target.value as ThemeMode } : s))}
                 style={styles.select}
               >
@@ -1441,7 +1920,7 @@ export default function App() {
                 起：
                 <input
                   type="time"
-                  value={settings.nightStart}
+                  value={settings?.nightStart ?? "23:00"}
                   onChange={(e) => setSettings((s) => (s ? { ...s, nightStart: e.target.value } : s))}
                   style={styles.time}
                 />
@@ -1451,7 +1930,7 @@ export default function App() {
                 止：
                 <input
                   type="time"
-                  value={settings.nightEnd}
+                  value={settings?.nightEnd ?? "08:00"}
                   onChange={(e) => setSettings((s) => (s ? { ...s, nightEnd: e.target.value } : s))}
                   style={styles.time}
                 />
@@ -1496,17 +1975,19 @@ export default function App() {
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 10 }}>
                       {evs.map((ev) => {
                         const label = formatEventLabel(ev, c.name);
+                        const { accent } = eventColorFamily(ev.categoryId, ev.id, isDark);
                         return (
                           <div key={ev.id} style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
                             <button
+                              data-noclear="true"
                               style={{
                                 ...styles.chip,
                                 background: theme.chipBg,
-                                border: `1px solid ${theme.chipBorder}`,
+                                border: `1px solid ${accent}`,
+
                                 color: theme.text,
                               }}
                               onClick={() => {
-                                // if there is selection -> apply, else just push into recent
                                 if (selected.size > 0) applyEvent(ev.id);
                                 else {
                                   setRecentEvents((prev) => {
@@ -1517,7 +1998,7 @@ export default function App() {
                               }}
                               title={selected.size > 0 ? "应用到选中格子" : "加入最近事件"}
                             >
-                              <span style={{ ...styles.dot, background: segmentAccentColor(label || ev.id, isDark) }} />
+                              <span style={{ ...styles.dot, background: accent }} />
                               {label}
                             </button>
 
@@ -1572,6 +2053,8 @@ export default function App() {
           </div>
         </div>
       )}
+       </>
+      )}
     </div>
   );
 }
@@ -1598,7 +2081,6 @@ function Header(props: {
       }}
       data-noclear="true"
     >
-      {/* top row */}
       <div style={headerStyles.topRow}>
         <div style={headerStyles.brandRow}>
           <div
@@ -1637,7 +2119,6 @@ function Header(props: {
         </div>
       </div>
 
-      {/* date row */}
       <div style={headerStyles.dateRow}>
         <button style={{ ...headerStyles.icon, color: theme.text, border: `1px solid ${theme.hairline}`, background: theme.panel }} onClick={onPrevDay}>
           ◀
@@ -1654,7 +2135,6 @@ function Header(props: {
   );
 }
 
-
 function SegButton(props: { active: boolean; onClick: () => void; children: React.ReactNode; theme: ReturnType<typeof makeThemeTokens> }) {
   const { active, onClick, children, theme } = props;
   return (
@@ -1662,6 +2142,30 @@ function SegButton(props: { active: boolean; onClick: () => void; children: Reac
       onClick={onClick}
       style={{
         ...headerStyles.segBtn,
+        background: active ? theme.panel : "transparent",
+        color: theme.text,
+        boxShadow: active ? theme.shadow : "none",
+        border: active ? `1px solid ${theme.hairline}` : "1px solid transparent",
+        transform: active ? "translateY(-0.5px)" : "translateY(0)",
+        transition: "transform 140ms ease, box-shadow 140ms ease, background 140ms ease",
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function Pill(props: { active: boolean; onClick: () => void; children: React.ReactNode; theme: ReturnType<typeof makeThemeTokens> }) {
+  const { active, onClick, children, theme } = props;
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        height: 34,
+        padding: "0 14px",
+        borderRadius: 999,
+        cursor: "pointer",
+        fontWeight: 950,
         background: active ? theme.panel : "transparent",
         color: theme.text,
         boxShadow: active ? theme.shadow : "none",
@@ -1715,7 +2219,7 @@ function AddEvent({
 
   return (
     <div style={styles.miniCard}>
-      <div style={styles.miniTitle}>新增二级（可空）</div>
+      <div style={styles.miniTitle}>新增二级</div>
       <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
         <select value={categoryId} onChange={(e) => setCategoryId(e.target.value)} style={styles.select}>
           {categories.map((c) => (
@@ -1730,16 +2234,15 @@ function AddEvent({
         <button
           style={styles.primaryBtn}
           onClick={() => {
-          if (!categoryId) return;
-          const trimmed = name.trim();
-          if (!trimmed) {
-            alert("请填写二级名称（必填）");
-            return;
-          }
-          onAdd(categoryId, trimmed);
-          setName("");
-        }}
-
+            if (!categoryId) return;
+            const trimmed = name.trim();
+            if (!trimmed) {
+              alert("请填写二级名称（必填）");
+              return;
+            }
+            onAdd(categoryId, trimmed);
+            setName("");
+          }}
         >
           添加
         </button>
@@ -1791,17 +2294,12 @@ function makeStyles(theme: ReturnType<typeof makeThemeTokens>, isDark: boolean) 
       gap: 14,
     },
 
-    quickRow: { display: "grid", gridTemplateColumns: "42px 1fr", gap: 10, alignItems: "center", marginTop: 10 },
-
-    quickTitle: { color: theme.sub, fontSize: 13, fontWeight: 900, whiteSpace: "nowrap" },
-
     chipsScroll: { display: "flex", gap: 10, overflowX: "auto", paddingBottom: 6, WebkitOverflowScrolling: "touch" },
-
 
     dot: { width: 10, height: 10, borderRadius: 999, display: "inline-block", marginRight: 8 },
 
     chip: {
-      padding: "8px 10px",      // 原来 9px 11px
+      padding: "8px 10px",
       borderRadius: 999,
       cursor: "pointer",
       whiteSpace: "nowrap",
@@ -1809,20 +2307,7 @@ function makeStyles(theme: ReturnType<typeof makeThemeTokens>, isDark: boolean) 
       display: "inline-flex",
       alignItems: "center",
       color: theme.text,
-      fontSize: 13,             // 新增：略小
-    },
-  
-
-
-    chipGhost: {
-      padding: "9px 11px",
-      borderRadius: 999,
-      cursor: "pointer",
-      whiteSpace: "nowrap",
-      fontWeight: 950,
-      border: `1px dashed ${theme.hairline}`,
-      background: theme.panel,
-      color: theme.text,
+      fontSize: 13,
     },
 
     gridWrap: {
@@ -2195,4 +2680,3 @@ const headerStyles: Record<string, React.CSSProperties> = {
     fontWeight: 950,
   },
 };
-
